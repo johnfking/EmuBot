@@ -2110,6 +2110,7 @@ function botUI.drawBotInventoryWindow()
         
         ImGui.Separator()
 
+        -- Export buttons
         ImGui.Text('Export Data:')
         ImGui.SameLine()
 

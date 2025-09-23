@@ -19,7 +19,7 @@ BotInventory.invlist_issued_time = nil
 BotInventory._resources_dir = nil
 
 local function normalizePathSeparators(path)
-    return path and path:gsub('\\', '/') or nil
+    return path and path:gsub('\\\\', '/') or nil
 end
 
 local function trimTrailingSlash(path)
@@ -87,10 +87,28 @@ local function detectResourcesDir()
     return BotInventory._resources_dir
 end
 
--- Convert itemID to a clickable web URL for karanaeq.com item database
-local function createKaranaeqURL(itemID)
+-- Convert itemID to a clickable web URL based on the selected export option
+local function createItemURL(itemID)
     if not itemID or itemID == 0 then return "" end
-    return string.format("https://karanaeq.com/Alla/?a=item&id=%s", tostring(itemID))
+    
+    -- Determine server to select appropriate URL
+    local serverName = ""
+    if mq and mq.TLO and mq.TLO.EverQuest and mq.TLO.EverQuest.Server then
+        local ok, server = pcall(function() return mq.TLO.EverQuest.Server() end)
+        if ok and server then
+            serverName = tostring(server)
+        end
+    end
+    
+    -- Return URL based on server
+    if serverName == "Karana" then
+        return string.format("https://karanaeq.com/Alla/?a=item&id=%s", tostring(itemID))
+    elseif serverName == "Shadowed Eclipse" then
+        return string.format("http://shadowedeclipse.com/?a=item&id=%s", tostring(itemID))
+    else
+        -- For other servers, return empty string to skip hyperlinks
+        return ""
+    end
 end
 
 local function cloneItemForExport(item)
@@ -111,9 +129,9 @@ local function cloneItemForExport(item)
         nodrop = item.nodrop,
     }
 
-    -- Replace in-game itemlink with karanaeq.com URL if we have an itemID
+    -- Replace in-game itemlink with URL based on the server if we have an itemID
     if item.itemID and tonumber(item.itemID) and tonumber(item.itemID) > 0 then
-        copy.itemlink = createKaranaeqURL(item.itemID)
+        copy.itemlink = createItemURL(item.itemID)
     elseif type(item.itemlink) == "string" then
         copy.itemlink = item.itemlink  -- Fallback to original link if no itemID
     end
