@@ -1,0 +1,2569 @@
+local mq = require('mq')
+local ImGui = require('ImGui')
+
+local bot_inventory = require('EmuBot.modules.bot_inventory')
+
+local function printf(fmt, ...)
+    if mq.printf then
+        mq.printf(fmt, ...)
+    else
+        print(string.format(fmt, ...))
+    end
+end
+local function refreshBotList()
+    if not bot_inventory or not bot_inventory.refreshBotList then return end
+    bot_inventory.refreshBotList()
+end
+
+local EQ_ICON_OFFSET = 500
+local ICON_WIDTH = 20
+local ICON_HEIGHT = 20
+local animItems = mq.FindTextureAnimation('A_DragItem')
+
+local botUI = {
+    showWindow = true,
+    botFetchDelay = 1.0,
+    botSpawnDelay = 2.0,
+    botTargetDelay = 1.0,
+    selectedBot = nil,
+    selectedBotSlotID = nil,
+    selectedBotSlotName = nil,
+    _botInventoryFetchQueue = {},
+    _botInventoryFetchSet = {},
+    _botInventoryFetchActive = false,
+    _botInventoryLastAttempt = {},
+    _botListRequested = false,
+    _scanQueue = {},
+    _scanActive = false,
+    deferred_tasks = {},
+    lastExportMessage = nil,
+    lastExportWasSuccess = false,
+    -- Scan All Bots functionality
+    _scanAllActive = false,
+    _scanAllQueue = {},
+    _scanAllCurrentBot = nil,
+    _scanAllBotIndex = 0,
+    _scanAllStartTime = nil,
+    _scanAllProgress = '',
+    _scanAllTotalItems = 0,
+    -- Floating toggle button
+    showFloatingToggle = true,
+    floatingPosX = 60,
+    floatingPosY = 60,
+    floatingButtonSize = 50,
+    -- Local inventory comparison
+    localInventoryCache = nil,
+    localInventoryCacheTime = 0,
+    localInventoryCacheDuration = 60, -- Cache duration in seconds
+    showLocalCompareWindow = false,
+    localCompareItems = {},
+    rightClickedBotItem = nil,
+    -- Bot failure tracking
+    _botFailureCount = {},
+    _maxFailures = 3, -- Max attempts before skipping a bot
+    _failureTimeout = 300, -- 5 minutes before allowing retry of failed bot
+    _skippedBots = {}, -- Track skipped bots with timestamp
+}
+
+local function drawItemIcon(iconID, width, height)
+    width = width or ICON_WIDTH
+    height = height or ICON_HEIGHT
+    if iconID and iconID > 0 and animItems then
+        animItems:SetTextureCell(iconID - EQ_ICON_OFFSET)
+        ImGui.DrawTextureAnimation(animItems, width, height)
+    else
+        ImGui.Text('N/A')
+    end
+end
+
+local function enqueueTask(fn)
+    table.insert(botUI.deferred_tasks, fn)
+end
+
+local function processDeferredTasks()
+    if #botUI.deferred_tasks == 0 then return end
+    local task = table.remove(botUI.deferred_tasks, 1)
+    local ok, err = pcall(task)
+    if not ok then
+        printf('[EmuBot] Deferred task error: %s', tostring(err))
+    end
+end
+
+local function captureDisplayItemIcon(target)
+    if not target then return end
+    local displayItem = mq.TLO.DisplayItem
+    if displayItem and displayItem() then
+        local iconValue = tonumber(displayItem.Icon() or 0) or 0
+        if iconValue > 0 then
+            target.icon = iconValue
+            target.iconID = iconValue
+        end
+    end
+end
+
+local function captureAugmentData(target)
+    if not target then return false end
+    local displayItem = mq.TLO.DisplayItem
+    if not displayItem or not displayItem() then return false end
+
+    local baseItem = displayItem.Item
+    if not baseItem or not baseItem() then return false end
+
+    local success = false
+
+    for augIndex = 1, 6 do
+        local nameField = 'aug' .. augIndex .. 'Name'
+        local linkField = 'aug' .. augIndex .. 'link'
+        local iconField = 'aug' .. augIndex .. 'Icon'
+
+        local augTLO
+        local ok, result = pcall(function()
+            if baseItem.Item then
+                return baseItem.Item(augIndex)
+            end
+            return nil
+        end)
+        if ok then augTLO = result end
+
+        local name, link, icon = nil, nil, nil
+        local augIsValid = false
+        if augTLO then
+            ok, augIsValid = pcall(function()
+                local value = augTLO()
+                return value ~= nil and value ~= ''
+            end)
+            if not ok then augIsValid = false end
+        end
+
+        if augTLO and augIsValid then
+            ok, name = pcall(function()
+                if augTLO.Name then
+                    return augTLO.Name()
+                end
+                return nil
+            end)
+            if not ok then name = nil end
+            ok, link = pcall(function()
+                if augTLO.ItemLink then
+                    return augTLO.ItemLink()
+                end
+                return nil
+            end)
+            if not ok then link = nil end
+            ok, icon = pcall(function()
+                if augTLO.Icon then
+                    return tonumber(augTLO.Icon() or 0) or 0
+                end
+                return 0
+            end)
+            if not ok then icon = nil end
+        end
+
+        if name and name ~= '' then
+            target[nameField] = name
+            target[linkField] = link and link ~= '' and link or nil
+            target[iconField] = icon or 0
+            success = true
+        else
+            target[nameField] = nil
+            target[linkField] = nil
+            target[iconField] = nil
+        end
+    end
+
+    return success
+end
+
+local function getDisplayItemNumber(accessor)
+    if not accessor then return 0 end
+    local ok, value = pcall(function()
+        local result = accessor()
+        return tonumber(result) or 0
+    end)
+    if ok and value then return value end
+    return 0
+end
+
+local function populateStatsFromDisplayItem(target)
+    if not target then return false, false end
+
+    local displayItem = mq.TLO.DisplayItem
+    if not displayItem or not displayItem() then return false, false end
+
+    local item = displayItem.Item
+    if not item or not item() then return false, false end
+
+    local ac = getDisplayItemNumber(item.AC)
+    if ac == 0 and item.TotalAC then
+        ac = getDisplayItemNumber(item.TotalAC)
+    end
+
+    local hp = getDisplayItemNumber(item.HP)
+    if hp == 0 and item.HitPoints then
+        hp = getDisplayItemNumber(item.HitPoints)
+    end
+
+    local mana = getDisplayItemNumber(item.Mana)
+
+    target.ac = ac
+    target.hp = hp
+    target.mana = mana
+
+    local hasNonZero = (ac ~= 0) or (hp ~= 0) or (mana ~= 0)
+    return true, hasNonZero
+end
+
+local function getTimeMs()
+    if mq.gettime then
+        local ok, value = pcall(mq.gettime)
+        if ok and value then return value end
+    end
+    return math.floor((os.clock() or 0) * 1000)
+end
+
+local function collectBotNames()
+    local set = {}
+    local list = {}
+
+    if bot_inventory then
+        -- Get bots from getAllBots function
+        if bot_inventory.getAllBots then
+            local allBots = bot_inventory.getAllBots() or {}
+            for _, name in ipairs(allBots) do
+                if name and type(name) == 'string' and name:match('^%s*(.-)%s*$') ~= '' and not set[name] then
+                    set[name] = true
+                    table.insert(list, name)
+                end
+            end
+        end
+        
+        -- Get bots from bot_inventories
+        if bot_inventory.bot_inventories then
+            for name in pairs(bot_inventory.bot_inventories) do
+                if name and type(name) == 'string' and name:match('^%s*(.-)%s*$') ~= '' and not set[name] then
+                    set[name] = true
+                    table.insert(list, name)
+                end
+            end
+        end
+        
+        -- Get bots from cached_bot_list
+        if bot_inventory.cached_bot_list then
+            for _, name in ipairs(bot_inventory.cached_bot_list) do
+                if name and type(name) == 'string' and name:match('^%s*(.-)%s*$') ~= '' and not set[name] then
+                    set[name] = true
+                    table.insert(list, name)
+                end
+            end
+        end
+    end
+    
+    -- Sort the list case-insensitively
+    table.sort(list, function(a, b) return (a or ''):lower() < (b or ''):lower() end)
+
+    return list, set
+end
+
+local function syncSelectedBotData()
+    if not botUI.selectedBot or not botUI.selectedBot.name then return end
+    if not bot_inventory or not bot_inventory.bot_inventories then return end
+    local botName = botUI.selectedBot.name
+    local updated = bot_inventory.bot_inventories[botName]
+    if updated then
+        local itemCount = updated.equipped and #updated.equipped or 0
+        if itemCount > 0 and updated.equipped[1] then
+        end
+        botUI.selectedBot.data = updated
+    end
+end
+
+local function collectBotSlotItems(slotId)
+    local results = {}
+    local names, nameSet = collectBotNames()
+
+    if botUI.selectedBot and botUI.selectedBot.name then
+        local name = botUI.selectedBot.name
+        if not nameSet[name] then
+            table.insert(names, name)
+            nameSet[name] = true
+        end
+    end
+
+    if #names == 0 and botUI.selectedBot and botUI.selectedBot.name then
+        table.insert(names, botUI.selectedBot.name)
+    end
+
+    for _, botName in ipairs(names) do
+        local foundItem = nil
+        local cachedData = bot_inventory and bot_inventory.bot_inventories and bot_inventory.bot_inventories[botName] or nil
+
+        if botUI.selectedBot and botUI.selectedBot.name == botName and botUI.selectedBot.data then
+            for _, item in ipairs(botUI.selectedBot.data.equipped or {}) do
+                if tonumber(item.slotid) == slotId then
+                    foundItem = item
+                    break
+                end
+            end
+        end
+
+        if not foundItem and cachedData and cachedData.equipped then
+            for _, item in ipairs(cachedData.equipped) do
+                if tonumber(item.slotid) == slotId then
+                    foundItem = item
+                    break
+                end
+            end
+        end
+
+        table.insert(results, { bot = botName, item = foundItem })
+
+        if not foundItem and bot_inventory and bot_inventory.requestBotInventory then
+            botUI._botInventoryLastAttempt[botName] = botUI._botInventoryLastAttempt[botName] or 0
+            botUI._botInventoryFetchSet[botName] = botUI._botInventoryFetchSet[botName] or false
+            if not botUI._botInventoryFetchSet[botName] then
+                table.insert(botUI._botInventoryFetchQueue, botName)
+                botUI._botInventoryFetchSet[botName] = true
+                if not botUI._botInventoryFetchActive then
+                    botUI._botInventoryFetchActive = true
+                    enqueueTask(botUI._processBotInventoryQueue)
+                end
+            end
+        end
+    end
+
+    return results
+end
+
+function botUI._enqueueBotInventoryFetch(botName)
+    if not botName or botName == '' or not bot_inventory or not bot_inventory.requestBotInventory then
+        return
+    end
+    
+    -- Check if bot is currently skipped due to failures
+    if botUI._skippedBots[botName] then
+        local skipTime = botUI._skippedBots[botName]
+        local elapsed = os.time() - skipTime
+        if elapsed < botUI._failureTimeout then
+            printf('[EmuBot] Bot %s is skipped due to failures, %d seconds remaining', botName, botUI._failureTimeout - elapsed)
+            return
+        else
+            -- Reset failure tracking after timeout
+            printf('[EmuBot] Failure timeout expired for %s, allowing retry', botName)
+            botUI._skippedBots[botName] = nil
+            botUI._botFailureCount[botName] = nil
+        end
+    end
+    
+    if botUI._botInventoryFetchSet[botName] then return end
+    table.insert(botUI._botInventoryFetchQueue, botName)
+    botUI._botInventoryFetchSet[botName] = true
+    botUI._botInventoryLastAttempt[botName] = 0
+    if not botUI._botInventoryFetchActive then
+        botUI._botInventoryFetchActive = true
+        enqueueTask(botUI._processBotInventoryQueue)
+    end
+end
+
+function botUI.startScanAllBots()
+    if botUI._scanAllActive then
+        printf('[EmuBot] Scan All Bots already in progress!')
+        return
+    end
+    
+    local botList, _ = collectBotNames()
+    if #botList == 0 then
+        printf('[EmuBot] No bots found to scan!')
+        return
+    end
+    
+    botUI._scanAllActive = true
+    botUI._scanAllQueue = {}
+    for _, botName in ipairs(botList) do
+        table.insert(botUI._scanAllQueue, botName)
+    end
+    botUI._scanAllBotIndex = 0
+    botUI._scanAllCurrentBot = nil
+    botUI._scanAllTotalItems = 0
+    botUI._scanAllStartTime = os.time()
+    botUI._scanAllProgress = string.format('Starting scan of %d bots...', #botList)
+    
+    printf('[EmuBot] Starting scan of all %d bots...', #botList)
+    enqueueTask(botUI._processScanAllBots)
+end
+
+function botUI.stopScanAllBots()
+    if not botUI._scanAllActive then return end
+    
+    botUI._scanAllActive = false
+    botUI._scanAllQueue = {}
+    botUI._scanAllCurrentBot = nil
+    botUI._scanAllBotIndex = 0
+    botUI._scanAllTotalItems = 0
+    botUI._scanAllProgress = 'Scan cancelled'
+    
+    printf('[EmuBot] Scan All Bots cancelled')
+end
+
+function botUI._awaitInventoryForBot(botName, shouldCamp)
+    local startTime = os.time()
+    local timeout = 15 -- seconds to wait before giving up on this bot
+    local function poll()
+        -- If scan was cancelled mid-wait, stop
+        if not botUI._scanAllActive then return true end
+
+        -- Check if inventory has been captured (primary check)
+        local inv = bot_inventory and bot_inventory.getBotInventory and bot_inventory.getBotInventory(botName)
+        if inv and inv.equipped and #inv.equipped > 0 then
+            printf('[EmuBot] Inventory captured for %s (%d items). Current request: %s', botName, #inv.equipped, bot_inventory.current_bot_request or 'nil')
+            botUI._completeScanAllBotStep(botName, shouldCamp)
+            return true
+        end
+
+        -- If current_bot_request changed but we don't have inventory yet, that's unexpected
+        if bot_inventory.current_bot_request ~= botName and bot_inventory.current_bot_request ~= nil then
+            printf('[EmuBot] Warning: bot_inventory moved to %s while waiting for %s (no inventory captured)', bot_inventory.current_bot_request or 'nil', botName)
+            -- Give it a moment to see if inventory appears
+            local elapsed = os.time() - startTime
+            if elapsed > 8 then  -- If we've been waiting a while, give up
+                printf('[EmuBot] Giving up on %s after %d seconds with no inventory', botName, elapsed)
+                botUI._completeScanAllBotStep(botName, shouldCamp)
+                return true
+            end
+        end
+
+        -- Timeout check
+        if os.time() - startTime >= timeout then
+            printf('[EmuBot] Timeout waiting for inventory from %s; proceeding.', botName)
+            -- Only clear on timeout if it's still our request
+            if bot_inventory.current_bot_request == botName then
+                printf('[EmuBot] Clearing stale bot_inventory request for %s due to timeout', botName)
+                bot_inventory.current_bot_request = nil
+                bot_inventory.bot_request_start_time = nil
+                bot_inventory.bot_request_phase = 0
+            end
+            botUI._completeScanAllBotStep(botName, shouldCamp)
+            return true
+        end
+
+        -- Update UI text while waiting
+        botUI._scanAllProgress = string.format('Waiting on %s inventory...', botName)
+        -- Re-enqueue poll after a short delay to avoid blocking
+        enqueueTask(function()
+            mq.delay(300) -- Back to faster polling to catch inventory quickly
+            botUI._awaitInventoryForBot(botName, shouldCamp)
+        end)
+        return true
+    end
+    enqueueTask(poll)
+end
+
+function botUI._processScanAllBots()
+    if not botUI._scanAllActive then return true end
+    
+    -- Check if we're done
+    if #botUI._scanAllQueue == 0 then
+        botUI._scanAllActive = false
+        local itemQueueSize = #botUI._scanQueue
+        botUI._scanAllProgress = string.format('Scan complete! Processed %d bots, %d items queued for scanning', 
+            botUI._scanAllBotIndex, botUI._scanAllTotalItems)
+        printf('[EmuBot] Scan All Bots completed! Processed %d bots, queued %d items for detailed scanning', 
+            botUI._scanAllBotIndex, botUI._scanAllTotalItems)
+        if bot_inventory and bot_inventory.bot_inventories then
+            for botName, data in pairs(bot_inventory.bot_inventories) do
+                local itemCount = data.equipped and #data.equipped or 0
+                local firstItem = (data.equipped and data.equipped[1] and data.equipped[1].name) or 'None'
+            end
+        end
+        
+        if itemQueueSize > 0 then
+            printf('[EmuBot] %d items are still being scanned in the background...', itemQueueSize)
+        end
+        return true
+    end
+    
+    -- Get the next bot to process
+    local currentBot = botUI._scanAllQueue[1]
+    if not currentBot then
+        enqueueTask(botUI._processScanAllBots)
+        return true
+    end
+    
+    botUI._scanAllCurrentBot = currentBot
+    botUI._scanAllBotIndex = botUI._scanAllBotIndex + 1
+    botUI._scanAllProgress = string.format('Processing bot %d/%d: %s', 
+        botUI._scanAllBotIndex, 
+        botUI._scanAllBotIndex + #botUI._scanAllQueue - 1, 
+        currentBot)
+    
+    -- Check if bot is already spawned
+    local botSpawn = mq.TLO.Spawn(string.format('= %s', currentBot))
+    local isSpawned = botSpawn and botSpawn.ID and botSpawn.ID() and botSpawn.ID() > 0
+    
+    -- Safety check: ensure no other bot request is active
+    if bot_inventory.current_bot_request and bot_inventory.current_bot_request ~= currentBot then
+        -- Check if the old request is actually stale (started more than 20 seconds ago)
+        local requestAge = bot_inventory.bot_request_start_time and (os.time() - bot_inventory.bot_request_start_time) or 999
+        if requestAge > 20 then
+            printf('[EmuBot] Clearing stale bot request (%s, %d seconds old) before starting %s', bot_inventory.current_bot_request, requestAge, currentBot)
+            bot_inventory.current_bot_request = nil
+            bot_inventory.bot_request_start_time = nil
+            bot_inventory.bot_request_phase = 0
+        else
+            printf('[EmuBot] Warning: Recent bot request (%s) still active, but proceeding with %s', bot_inventory.current_bot_request, currentBot)
+        end
+    end
+
+    if isSpawned then
+        -- Bot is already spawned, just get inventory
+        printf('[EmuBot] Bot %s already spawned, requesting inventory...', currentBot)
+        bot_inventory.requestBotInventory(currentBot)
+        -- Always camp after capture to respect spawn cap
+        botUI._awaitInventoryForBot(currentBot, true)
+    else
+        -- Bot needs to be spawned
+        printf('[EmuBot] Spawning bot %s...', currentBot)
+        mq.cmdf('/say ^spawn %s', currentBot)
+
+        enqueueTask(function()
+            mq.delay(3000) -- Wait for spawn to appear
+            local spawnCheck = mq.TLO.Spawn(string.format('= %s', currentBot))
+            if spawnCheck and spawnCheck.ID and spawnCheck.ID() and spawnCheck.ID() > 0 then
+                printf('[EmuBot] Bot %s spawned, requesting inventory...', currentBot)
+                bot_inventory.requestBotInventory(currentBot)
+                botUI._awaitInventoryForBot(currentBot, true) -- camp after capture
+            else
+                printf('[EmuBot] Failed to spawn bot %s, skipping...', currentBot)
+                botUI._completeScanAllBotStep(currentBot, false)
+            end
+        end)
+    end
+    
+    return true
+end
+
+local function _targetBotByName(botName)
+    if not botName or botName == '' then return false end
+    local spawn = mq.TLO.Spawn(string.format('= %s', botName))
+    if spawn and spawn.ID and spawn.ID() and spawn.ID() > 0 then
+        mq.cmdf('/target id %d', spawn.ID())
+        mq.delay(200)
+    else
+        mq.cmdf('/target "%s"', botName)
+        mq.delay(200)
+    end
+    local tgt = mq.TLO.Target
+    return (tgt and tgt() and tgt.Name() == botName) or false
+end
+
+function botUI._completeScanAllBotStep(botName, shouldCamp)
+    -- Get the bot's inventory data and queue items for scanning
+    local botData = bot_inventory and bot_inventory.getBotInventory and bot_inventory.getBotInventory(botName)
+    if botData and botData.equipped then
+        local itemsToScan = {}
+        for _, item in ipairs(botData.equipped) do
+            -- Check if item needs scanning (missing stats or has zero stats)
+            local needsScanning = (not item.ac and not item.hp and not item.mana)
+                or ((tonumber(item.ac or 0) == 0) and (tonumber(item.hp or 0) == 0) and (tonumber(item.mana or 0) == 0))
+            
+            if needsScanning and item.itemlink and item.itemlink ~= '' then
+                table.insert(itemsToScan, item)
+            end
+        end
+        
+        if #itemsToScan > 0 then
+            botUI._scanAllTotalItems = botUI._scanAllTotalItems + #itemsToScan
+            printf('[EmuBot] Queueing %d items from %s for detailed scanning...', #itemsToScan, botName)
+            for _, item in ipairs(itemsToScan) do
+                botUI.enqueueItemScan(item)
+            end
+        else
+            printf('[EmuBot] Bot %s inventory complete, no items need scanning', botName)
+        end
+    else
+        printf('[EmuBot] Warning: No inventory data found for %s after scan attempt', botName)
+    end
+
+    -- Always camp after inventory capture to avoid exceeding spawn caps
+    printf('[EmuBot] Camping bot %s...', botName)
+    local targeted = _targetBotByName(botName)
+    if targeted then
+        mq.cmd('/say ^botcamp')
+    else
+        printf('[EmuBot] Warning: could not target %s for camp. Skipping camp command.', botName)
+    end
+
+    -- Wait for the bot to despawn before proceeding (timeout safety)
+    local startWait = os.time()
+    local timeout = 10 -- seconds
+    local function waitDespawn()
+        local spawned = mq.TLO.Spawn(string.format('= %s', botName))
+        local stillThere = spawned and spawned.ID and spawned.ID() and spawned.ID() > 0
+        if not stillThere then
+            -- Remove this bot from the queue and proceed
+            if botUI._scanAllQueue[1] == botName then
+                table.remove(botUI._scanAllQueue, 1)
+            end
+            enqueueTask(botUI._processScanAllBots)
+            return true
+        end
+        if os.time() - startWait >= timeout then
+            printf('[EmuBot] Timed out waiting for %s to camp. Continuing...', botName)
+            if botUI._scanAllQueue[1] == botName then
+                table.remove(botUI._scanAllQueue, 1)
+            end
+            enqueueTask(botUI._processScanAllBots)
+            return true
+        end
+        botUI._scanAllProgress = string.format('Waiting for %s to camp...', botName)
+        enqueueTask(function()
+            mq.delay(500)
+            waitDespawn()
+        end)
+        return true
+    end
+    enqueueTask(function()
+        mq.delay(500)
+        waitDespawn()
+    end)
+end
+
+function botUI._processBotInventoryQueue()
+    local queue = botUI._botInventoryFetchQueue
+    if not queue or #queue == 0 then
+        botUI._botInventoryFetchActive = false
+        return true
+    end
+
+    local botName = queue[1]
+    if not botName then
+        table.remove(queue, 1)
+        return botUI._processBotInventoryQueue()
+    end
+    
+    -- Check if bot is skipped due to failures
+    if botUI._skippedBots[botName] then
+        -- Remove from queue and skip processing
+        table.remove(queue, 1)
+        botUI._botInventoryFetchSet[botName] = nil
+        enqueueTask(botUI._processBotInventoryQueue)
+        return true
+    end
+
+    if bot_inventory.current_bot_request and bot_inventory.current_bot_request ~= ''
+        and bot_inventory.current_bot_request ~= botName then
+        enqueueTask(botUI._processBotInventoryQueue)
+        return true
+    end
+
+    local data = bot_inventory.bot_inventories and bot_inventory.bot_inventories[botName]
+    if data and data.equipped and #data.equipped > 0 then
+        -- Success - reset failure count and remove from queue
+        table.remove(queue, 1)
+        botUI._botInventoryFetchSet[botName] = nil
+        botUI._botInventoryLastAttempt[botName] = nil
+        botUI._botFailureCount[botName] = nil
+        enqueueTask(botUI._processBotInventoryQueue)
+        return true
+    end
+    
+    -- Check if bot inventory system indicates failure
+    if not bot_inventory.current_bot_request and botUI._botInventoryLastAttempt[botName] then
+        local lastAttemptTime = botUI._botInventoryLastAttempt[botName]
+        local now = getTimeMs()
+        local timeSinceAttempt = now - lastAttemptTime
+        
+        -- If more than 15 seconds since last attempt and no current request, it likely failed
+        if timeSinceAttempt > 15000 then -- 15 seconds
+            local failCount = (botUI._botFailureCount[botName] or 0) + 1
+            botUI._botFailureCount[botName] = failCount
+            
+            printf('[EmuBot] Bot %s inventory request appears to have failed (attempt %d/%d)', botName, failCount, botUI._maxFailures)
+            
+            if failCount >= botUI._maxFailures then
+                -- Skip this bot
+                printf('[EmuBot] Bot %s exceeded max failures, skipping for %d seconds', botName, botUI._failureTimeout)
+                botUI._skippedBots[botName] = os.time()
+                table.remove(queue, 1)
+                botUI._botInventoryFetchSet[botName] = nil
+                enqueueTask(botUI._processBotInventoryQueue)
+                return true
+            end
+        end
+    end
+
+    local delayMs = math.max(100, math.floor((botUI.botFetchDelay or 1.0) * 1000))
+    local now = getTimeMs()
+    local lastAttempt = botUI._botInventoryLastAttempt[botName] or 0
+    if now - lastAttempt >= delayMs then
+        botUI._botInventoryLastAttempt[botName] = now
+        
+        -- Check failure count before attempting
+        local failCount = botUI._botFailureCount[botName] or 0
+        if failCount < botUI._maxFailures then
+            local success = bot_inventory.requestBotInventory(botName)
+            if not success then
+                -- Request was rejected (likely due to skip check)
+                printf('[EmuBot] Request rejected for %s, removing from queue', botName)
+                table.remove(queue, 1)
+                botUI._botInventoryFetchSet[botName] = nil
+                enqueueTask(botUI._processBotInventoryQueue)
+                return true
+            end
+        else
+            printf('[EmuBot] Bot %s has too many failures, removing from queue', botName)
+            table.remove(queue, 1)
+            botUI._botInventoryFetchSet[botName] = nil
+            enqueueTask(botUI._processBotInventoryQueue)
+            return true
+        end
+    end
+
+    enqueueTask(botUI._processBotInventoryQueue)
+    return true
+end
+
+function botUI._processNextScan()
+    local current = table.remove(botUI._scanQueue, 1)
+    if not current then
+        botUI._scanActive = false
+        return true
+    end
+    current.ac = 0
+    current.hp = 0
+    current.mana = 0
+    local links = mq.ExtractLinks(current.itemlink or '')
+    if not links or #links == 0 then
+        enqueueTask(botUI._processNextScan)
+        return true
+    end
+    local link = links[1]
+    local wnd = mq.TLO.Window('ItemDisplayWindow')
+    if wnd() and wnd.Open() then wnd.DoClose() end
+    if mq.ExecuteTextLink then mq.ExecuteTextLink(link) end
+    local attempts = 0
+    local maxAttempts = 20
+
+    local function tryRead()
+        local w = mq.TLO.Window('ItemDisplayWindow')
+        if not w() or not w.Open() then return false, false, false, false end
+
+        captureDisplayItemIcon(current)
+        local hasIcon = tonumber(current.icon or current.iconID or 0) or 0
+        hasIcon = hasIcon > 0
+        local augCaptured = captureAugmentData(current)
+        local statsCaptured, hasNonZero = populateStatsFromDisplayItem(current)
+
+        return statsCaptured, hasIcon, augCaptured, hasNonZero
+    end
+
+    local function poll()
+        attempts = attempts + 1
+        local statsCaptured, hasIcon, augCaptured, hasNonZero = tryRead()
+        if statsCaptured and hasIcon then
+            local w = mq.TLO.Window('ItemDisplayWindow')
+            if w() and w.Open() then w.DoClose() end
+            enqueueTask(botUI._processNextScan)
+            return true
+        end
+
+        if attempts >= maxAttempts then
+            local w = mq.TLO.Window('ItemDisplayWindow')
+            if not hasIcon then
+                captureDisplayItemIcon(current)
+                hasIcon = tonumber(current.icon or current.iconID or 0) > 0
+            end
+            if not augCaptured then
+                augCaptured = captureAugmentData(current)
+            end
+            if w() and w.Open() then w.DoClose() end
+            if not statsCaptured then
+                printf('[EmuBot] Warning: scan timed out for %s', tostring(current.name or current.slotname or 'unknown item'))
+            elseif not hasIcon then
+                printf('[EmuBot] Warning: icon not captured for %s', tostring(current.name or current.slotname or 'unknown item'))
+            elseif not hasNonZero then
+                -- No stats found, but we at least reset them to zero for consistency.
+            end
+            enqueueTask(botUI._processNextScan)
+            return true
+        end
+
+        enqueueTask(poll)
+        return true
+    end
+
+    enqueueTask(poll)
+    return true
+end
+
+function botUI.enqueueItemScan(item)
+    if not item or not item.itemlink then return end
+    table.insert(botUI._scanQueue, item)
+    if botUI._scanActive then return end
+    botUI._scanActive = true
+    enqueueTask(botUI._processNextScan)
+end
+
+-- Function to manually skip a bot
+function botUI.skipBot(botName, reason)
+    if not botName or botName == '' then return false end
+    botUI._skippedBots[botName] = os.time()
+    botUI._botFailureCount[botName] = botUI._maxFailures
+    
+    -- Remove from current queues
+    for i = #botUI._botInventoryFetchQueue, 1, -1 do
+        if botUI._botInventoryFetchQueue[i] == botName then
+            table.remove(botUI._botInventoryFetchQueue, i)
+        end
+    end
+    botUI._botInventoryFetchSet[botName] = nil
+    
+    printf('[EmuBot] Manually skipped bot %s%s', botName, reason and (' - ' .. reason) or '')
+    return true
+end
+
+-- Function to clear a bot from skip list
+function botUI.unskipBot(botName)
+    if not botName or botName == '' then return false end
+    
+    local wasSkipped = botUI._skippedBots[botName] ~= nil
+    botUI._skippedBots[botName] = nil
+    botUI._botFailureCount[botName] = nil
+    
+    if wasSkipped then
+        printf('[EmuBot] Removed %s from skip list', botName)
+    else
+        printf('[EmuBot] Bot %s was not in skip list', botName)
+    end
+    return wasSkipped
+end
+
+-- Function to clear all skipped bots
+function botUI.clearAllSkippedBots()
+    local count = 0
+    for botName, _ in pairs(botUI._skippedBots) do
+        count = count + 1
+    end
+    
+    botUI._skippedBots = {}
+    botUI._botFailureCount = {}
+    
+    printf('[EmuBot] Cleared %d bots from skip list', count)
+    return count
+end
+
+-- Function to get list of skipped bots
+function botUI.getSkippedBots()
+    local skipped = {}
+    local now = os.time()
+    
+    for botName, skipTime in pairs(botUI._skippedBots) do
+        local elapsed = now - skipTime
+        local remaining = math.max(0, botUI._failureTimeout - elapsed)
+        table.insert(skipped, {
+            name = botName,
+            skipTime = skipTime,
+            remaining = remaining,
+            failures = botUI._botFailureCount[botName] or 0
+        })
+    end
+    
+    -- Sort by time remaining
+    table.sort(skipped, function(a, b) return a.remaining > b.remaining end)
+    
+    return skipped
+end
+
+local function getSlotNameFromID(slotID)
+    local slotNames = {
+        [0] = 'Charm',
+        [1] = 'Left Ear',
+        [2] = 'Head',
+        [3] = 'Face',
+        [4] = 'Right Ear',
+        [5] = 'Neck',
+        [6] = 'Shoulders',
+        [7] = 'Arms',
+        [8] = 'Back',
+        [9] = 'Left Wrist',
+        [10] = 'Right Wrist',
+        [11] = 'Range',
+        [12] = 'Hands',
+        [13] = 'Primary',
+        [14] = 'Secondary',
+        [15] = 'Left Ring',
+        [16] = 'Right Ring',
+        [17] = 'Chest',
+        [18] = 'Legs',
+        [19] = 'Feet',
+        [20] = 'Waist',
+        [21] = 'Power Source',
+        [22] = 'Ammo',
+    }
+    return slotNames[slotID] or 'Unknown Slot'
+end
+
+local function getEquippedSlotLayout()
+    return {
+        {1, 2, 3, 4},
+        {17, '', '', 5},
+        {7, '', '', 8},
+        {20, '', '', 6},
+        {9, '', '', 10},
+        {18, 12, 0, 19},
+        {'', 15, 16, 21},
+        {13, 14, 11, 22},
+    }
+end
+
+local function getSlotName(slotId)
+    return getSlotNameFromID(slotId) or 'Unknown'
+end
+
+-- Function to check if an item can be worn in a specific slot
+local function canItemFitInSlot(itemTLO, slotId)
+    if not itemTLO or not itemTLO() then return false end
+    
+    -- Get target slot ID as number for comparison
+    local targetSlotId = tonumber(slotId)
+    if not targetSlotId then return false end
+    
+    -- Get number of worn slots for this item
+    local slotCount = 0
+    local success, count = pcall(function() return itemTLO.WornSlots() end)
+    if success and count then slotCount = tonumber(count) or 0 end
+    
+    if slotCount == 0 then return false end
+    
+    -- Check each worn slot by ID number instead of name
+    for i = 1, slotCount do
+        local success, slotIdValue = pcall(function() return itemTLO.WornSlot(i).ID() end)
+        if success and slotIdValue and tonumber(slotIdValue) == targetSlotId then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Alternative function to check by name if ID method doesn't work
+local function canItemFitInSlotByName(itemTLO, slotId)
+    if not itemTLO or not itemTLO() then return false end
+    
+    -- Convert from slotId to slot name for comparison
+    local targetSlotName = getSlotNameFromID(tonumber(slotId))
+    if not targetSlotName then return false end
+    
+    -- Get number of worn slots for this item
+    local slotCount = 0
+    local success, count = pcall(function() return itemTLO.WornSlots() end)
+    if success and count then slotCount = tonumber(count) or 0 end
+    
+    if slotCount == 0 then return false end
+    
+    -- Check each worn slot by name
+    for i = 1, slotCount do
+        local success, slotName = pcall(function() return itemTLO.WornSlot(i)() end)
+        if success and slotName and slotName == targetSlotName then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Function to check if an item can be used by a specific class
+local function canItemBeUsedByClass(itemTLO, className)
+    if not itemTLO or not itemTLO() or not className then return false end
+    
+    -- Get number of classes that can use this item
+    local classCount = 0
+    local success, count = pcall(function() return itemTLO.Classes() end)
+    if success and count then classCount = tonumber(count) or 0 end
+    
+    if classCount == 0 then return false end
+    
+    -- If item has 16 classes, it's usable by all classes
+    if classCount >= 16 then
+        return true
+    end
+    
+    -- Check each class this item can be used by
+    for i = 1, classCount do
+        local success, itemClass = pcall(function() return itemTLO.Class(i)() end)
+        if success and itemClass then
+            -- Handle different class name formats
+            local normalizedItemClass = itemClass:upper()
+            local normalizedBotClass = className:upper()
+            
+            -- Direct match
+            if normalizedItemClass == normalizedBotClass then
+                return true
+            end
+            
+            -- Handle common abbreviations and variations
+            local classMap = {
+                ["WAR"] = "WARRIOR",
+                ["CLR"] = "CLERIC", 
+                ["PAL"] = "PALADIN",
+                ["RNG"] = "RANGER",
+                ["SHD"] = "SHADOW KNIGHT", ["SK"] = "SHADOW KNIGHT", ["SHADOWKNIGHT"] = "SHADOW KNIGHT",
+                ["DRU"] = "DRUID",
+                ["MNK"] = "MONK",
+                ["BRD"] = "BARD",
+                ["ROG"] = "ROGUE",
+                ["SHM"] = "SHAMAN",
+                ["NEC"] = "NECROMANCER",
+                ["WIZ"] = "WIZARD",
+                ["MAG"] = "MAGICIAN",
+                ["ENC"] = "ENCHANTER",
+                ["BST"] = "BEASTLORD", ["BEAST"] = "BEASTLORD", ["BL"] = "BEASTLORD",
+                ["BER"] = "BERSERKER"
+            }
+            
+            -- Try mapped versions
+            local mappedItemClass = classMap[normalizedItemClass] or normalizedItemClass
+            local mappedBotClass = classMap[normalizedBotClass] or normalizedBotClass
+            
+            if mappedItemClass == mappedBotClass then
+                return true
+            end
+            
+            -- Try reverse mapping
+            if classMap[mappedBotClass] == normalizedItemClass or 
+               classMap[mappedItemClass] == normalizedBotClass then
+                return true
+            end
+        end
+    end
+    
+    return false
+end
+
+-- Function to get bot class information
+local function getBotClass(botName)
+    if not botName then return nil end
+    
+    -- First check the bot list capture data
+    if bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[botName] then
+        return bot_inventory.bot_list_capture_set[botName].Class
+    end
+    
+    -- If not found, try to get from cached bot list or other sources
+    -- This is a fallback - you might need to adapt based on your data structure
+    return nil
+end
+
+-- Function to create an item data structure from a MQ item TLO
+local function createItemDataFromTLO(itemTLO, location, slotid, bagid, slotname)
+    if not itemTLO or not itemTLO() then return nil end
+    
+    local item = {
+        name = itemTLO.Name() or "Unknown Item",
+        slotid = slotid,
+        slotname = slotname or "",
+        itemlink = itemTLO.ItemLink("CLICKABLE")() or "",
+        icon = tonumber(itemTLO.Icon() or 0) or 0,
+        iconID = tonumber(itemTLO.Icon() or 0) or 0,
+        ac = tonumber(itemTLO.AC() or 0) or 0,
+        hp = tonumber(itemTLO.HP() or 0) or 0,
+        mana = tonumber(itemTLO.Mana() or 0) or 0,
+        itemID = tonumber(itemTLO.ID() or 0) or 0,
+        location = location,
+        bagid = bagid,
+        nodrop = itemTLO.NoDrop() and 1 or 0,
+    }
+    
+    -- Optional: if you want to gather augments too
+    for augSlot = 1, 6 do
+        local augItem = itemTLO.AugSlot(augSlot).Item
+        if augItem() then
+            item["aug" .. augSlot .. "Name"] = augItem.Name()
+            item["aug" .. augSlot .. "link"] = augItem.ItemLink("CLICKABLE")()
+            item["aug" .. augSlot .. "Icon"] = augItem.Icon()
+        end
+    end
+    
+    return item
+end
+
+-- Function to scan local character inventory
+function botUI.scanLocalInventory(forceRefresh)
+    -- Check cache validity
+    local now = os.time()
+    if not forceRefresh and 
+       botUI.localInventoryCache and 
+       (now - botUI.localInventoryCacheTime) < botUI.localInventoryCacheDuration then
+        return botUI.localInventoryCache
+    end
+    
+    local result = {
+        equipped = {},
+        bags = {}
+    }
+    
+    -- Scan equipped items
+    for slot = 0, 22 do
+        local item = mq.TLO.Me.Inventory(slot)
+        if item() then
+            local slotName = getSlotName(slot)
+            local itemData = createItemDataFromTLO(item, "Equipped", slot, nil, slotName)
+            if itemData then
+                table.insert(result.equipped, itemData)
+            end
+        end
+    end
+    
+    -- Scan general inventory and bags
+    for invSlot = 23, 34 do
+        local pack = mq.TLO.Me.Inventory(invSlot)
+        if pack() and pack.Container() > 0 then
+            local bagid = invSlot - 22  -- Convert to 1-based bag index
+            result.bags[bagid] = {}
+            
+            for slot = 1, pack.Container() do
+                local item = pack.Item(slot)
+                if item() then
+                    local itemData = createItemDataFromTLO(item, "Bags", slot, bagid, pack.Name() or "")
+                    if itemData then
+                        table.insert(result.bags[bagid], itemData)
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Update cache
+    botUI.localInventoryCache = result
+    botUI.localInventoryCacheTime = now
+    
+    return result
+end
+
+-- Debug function to test slot compatibility for a specific item
+function botUI.debugItemSlotCompatibility(itemName, slotId, className)
+    local item = mq.TLO.FindItem(itemName)
+    if not item() then
+        printf('[EmuBot] Item "%s" not found', itemName)
+        return
+    end
+    
+    printf('[EmuBot] Testing compatibility for "%s" with slot %s (ID: %d)', itemName, getSlotNameFromID(slotId) or 'Unknown', slotId)
+    if className then
+        printf('[EmuBot] Testing class compatibility with: %s', className)
+    end
+    printf('[EmuBot] Item Type: %s', item.Type() or 'Unknown')
+    printf('[EmuBot] Item Class: %s', item.ItemClass() or 'Unknown')
+    
+    local slotCount = 0
+    local success, count = pcall(function() return item.WornSlots() end)
+    if success and count then slotCount = tonumber(count) or 0 end
+    
+    printf('[EmuBot] Item has %d worn slot(s):', slotCount)
+    
+    for i = 1, slotCount do
+        local success1, slotIdValue = pcall(function() return item.WornSlot(i).ID() end)
+        local success2, slotName = pcall(function() return item.WornSlot(i)() end)
+        
+        local slotIdStr = success1 and slotIdValue and tostring(slotIdValue) or 'N/A'
+        local slotNameStr = success2 and slotName or 'N/A'
+        
+        printf('[EmuBot]   Slot %d: ID=%s, Name="%s", Matches=%s', i, slotIdStr, slotNameStr, 
+               (success1 and tonumber(slotIdValue) == tonumber(slotId)) and 'YES' or 'NO')
+    end
+    
+    local fits1 = canItemFitInSlot(item, slotId)
+    local fits2 = canItemFitInSlotByName(item, slotId)
+    
+    printf('[EmuBot] Slot compatibility: ID method=%s, Name method=%s', 
+           fits1 and 'YES' or 'NO', fits2 and 'YES' or 'NO')
+    
+    -- Test class compatibility if class provided
+    if className then
+        printf('[EmuBot] Class compatibility testing:')
+        local classCount = 0
+        local success, count = pcall(function() return item.Classes() end)
+        if success and count then classCount = tonumber(count) or 0 end
+        
+        printf('[EmuBot] Item usable by %d class(es):', classCount)
+        
+        for i = 1, classCount do
+            local success, itemClass = pcall(function() return item.Class(i)() end)
+            if success and itemClass then
+                printf('[EmuBot]   Class %d: %s', i, itemClass)
+            end
+        end
+        
+        local classCompatible = canItemBeUsedByClass(item, className)
+        printf('[EmuBot] Class compatibility result: %s', classCompatible and 'YES' or 'NO')
+        
+        local overallCompatible = (fits1 or fits2) and classCompatible
+        printf('[EmuBot] Overall compatibility: %s', overallCompatible and 'YES' or 'NO')
+    end
+end
+
+-- Function to find items in local inventory that can fit in a specific slot
+function botUI.findLocalItemsForSlot(slotId, compareItem, botName)
+    local localInventory = botUI.scanLocalInventory()
+    local compatibleItems = {}
+    
+    -- Get bot class for filtering
+    local botClass = nil
+    if botName then
+        botClass = getBotClass(botName)
+    end
+    
+    printf('[EmuBot] Scanning local inventory for slot %s (ID: %d)', getSlotNameFromID(slotId) or 'Unknown', slotId)
+    if botClass then
+        printf('[EmuBot] Filtering for bot class: %s', botClass)
+    else
+        printf('[EmuBot] No class filtering (bot class unknown)')
+    end
+    printf('[EmuBot] Found %d equipped items and %d bags to scan', #localInventory.equipped, 
+           (function() local count = 0; for _ in pairs(localInventory.bags) do count = count + 1 end; return count end)())
+    
+    -- Check equipped items
+    for _, item in ipairs(localInventory.equipped) do
+        local itemTLO = mq.TLO.Me.Inventory(item.slotid)
+        if itemTLO() then
+            printf('[EmuBot] Testing equipped item: %s (slot %d)', item.name, item.slotid)
+            local fits = canItemFitInSlot(itemTLO, slotId)
+            if not fits then
+                -- Try backup method
+                fits = canItemFitInSlotByName(itemTLO, slotId)
+            end
+            
+            local classCompatible = true
+            if botClass then
+                classCompatible = canItemBeUsedByClass(itemTLO, botClass)
+                if not classCompatible then
+                    printf('[EmuBot] ✗ Equipped item %s slot-compatible but wrong class', item.name)
+                end
+            end
+            
+            if fits and classCompatible then
+                printf('[EmuBot] ✓ Found compatible equipped item: %s', item.name)
+                -- Create a copy to avoid modifying original
+                local compatibleItem = {}
+                for k, v in pairs(item) do
+                    compatibleItem[k] = v
+                end
+                compatibleItem.source = "equipped"
+                compatibleItem.classCompatible = classCompatible
+                table.insert(compatibleItems, compatibleItem)
+            else
+                local reason = not fits and 'slot incompatible' or 'class incompatible'
+                printf('[EmuBot] ✗ Equipped item %s not compatible (%s)', item.name, reason)
+            end
+        else
+            printf('[EmuBot] ⚠ Could not access equipped item TLO for slot %d', item.slotid)
+        end
+    end
+    
+    -- Check bag items
+    for bagid, bag in pairs(localInventory.bags) do
+        printf('[EmuBot] Scanning bag %d with %d items', bagid, #bag)
+        for _, item in ipairs(bag) do
+            local invSlot = bagid + 22  -- Convert to actual inventory slot
+            local pack = mq.TLO.Me.Inventory(invSlot)
+            if pack() and pack.Container() > 0 then
+                local itemTLO = pack.Item(item.slotid)
+                if itemTLO() then
+                    printf('[EmuBot] Testing bag item: %s (bag %d, slot %d)', item.name, bagid, item.slotid)
+                    local fits = canItemFitInSlot(itemTLO, slotId)
+                    if not fits then
+                        -- Try backup method
+                        fits = canItemFitInSlotByName(itemTLO, slotId)
+                    end
+                    
+                    local classCompatible = true
+                    if botClass then
+                        classCompatible = canItemBeUsedByClass(itemTLO, botClass)
+                    end
+                    
+                    if fits and classCompatible then
+                        local compatibleItem = {}
+                        for k, v in pairs(item) do
+                            compatibleItem[k] = v
+                        end
+                        compatibleItem.source = "bag"
+                        compatibleItem.sourceBag = bagid
+                        compatibleItem.classCompatible = classCompatible
+                        table.insert(compatibleItems, compatibleItem)
+                    else
+                        local reason = not fits and 'slot incompatible' or 'class incompatible'
+                    end
+                end
+            end
+        end
+    end
+    
+    printf('[EmuBot] Scan complete: found %d compatible items', #compatibleItems)
+    
+    -- Sort by stats (basic comparison - prioritize AC, HP, then Mana)
+    if compareItem then
+        table.sort(compatibleItems, function(a, b)
+            -- Calculate a simple score for comparison
+            local scoreA = (a.ac or 0) + (a.hp or 0) * 0.5 + (a.mana or 0) * 0.3
+            local scoreB = (b.ac or 0) + (b.hp or 0) * 0.5 + (b.mana or 0) * 0.3
+            return scoreA > scoreB
+        end)
+    end
+    
+    return compatibleItems
+end
+
+-- Function to draw the local items comparison window
+function botUI.drawLocalComparisonWindow()
+    if not botUI.showLocalCompareWindow or not botUI.rightClickedBotItem then return end
+    
+    local windowFlags = ImGuiWindowFlags.None
+    
+    ImGui.SetNextWindowSize(ImVec2(800, 600), ImGuiCond.FirstUseEver)
+    local isOpen, shouldShow = ImGui.Begin('Local Items Comparison##LocalCompare', true, windowFlags)
+    
+    if not isOpen then
+        botUI.showLocalCompareWindow = false
+        botUI.rightClickedBotItem = nil
+        ImGui.End()
+        return
+    end
+    
+    if shouldShow then
+        local botItem = botUI.rightClickedBotItem
+        local slotId = botItem.slotid
+        local slotName = botItem.slotname or getSlotName(slotId) or "Unknown"
+        
+        -- Header information
+        ImGui.Text(string.format("Local Items for %s Slot", slotName))
+        ImGui.SameLine()
+        ImGui.TextColored(0.7, 0.7, 0.7, 1.0, string.format("(Slot ID: %d)", slotId))
+        
+        ImGui.Spacing()
+        ImGui.Text(string.format("Comparing against bot's current item: %s", botItem.name or "Unknown"))
+        
+        -- Try to get the bot name from the context
+        local contextBotName = nil
+        if botUI.selectedBot and botUI.selectedBot.name then
+            contextBotName = botUI.selectedBot.name
+        end
+        
+        -- Refresh button
+        if ImGui.Button("Refresh Scan") then
+            botUI.localCompareItems = botUI.findLocalItemsForSlot(slotId, botItem, contextBotName)
+            printf('[EmuBot] Refreshed scan - found %d compatible items', #botUI.localCompareItems)
+        end
+        
+        ImGui.SameLine()
+        if ImGui.Button("Clear Cache") then
+            botUI.scanLocalInventory(true) -- Force refresh
+            botUI.localCompareItems = botUI.findLocalItemsForSlot(slotId, botItem, contextBotName)
+            printf('[EmuBot] Cleared cache and rescanned - found %d compatible items', #botUI.localCompareItems)
+        end
+        
+        ImGui.Separator()
+        
+        -- Item count and stats
+        ImGui.Text(string.format("Found %d compatible items in your inventory", #botUI.localCompareItems))
+        
+        if #botUI.localCompareItems == 0 then
+            ImGui.Spacing()
+            ImGui.TextColored(0.9, 0.3, 0.3, 1.0, "No compatible items found in your inventory.")
+            ImGui.Text("This could mean:")
+            ImGui.BulletText("You don't have any items that can be equipped in this slot")
+            ImGui.BulletText("Your items are in bank or other storage")
+            ImGui.BulletText("Item scanning encountered an issue (check console)")
+            ImGui.Spacing()
+            ImGui.Text("Try the 'Clear Cache' button to force a fresh scan.")
+        else
+            ImGui.Spacing()
+        end
+        
+        if #botUI.localCompareItems > 0 and ImGui.BeginTable("LocalItemsComparisonTable", 8, 
+                           ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.Sortable) then
+            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch)
+            ImGui.TableSetupColumn("Source", ImGuiTableColumnFlags.WidthFixed, 80)
+            ImGui.TableSetupColumn("Icon", ImGuiTableColumnFlags.WidthFixed, 48)
+            ImGui.TableSetupColumn("AC", ImGuiTableColumnFlags.WidthFixed, 50)
+            ImGui.TableSetupColumn("HP", ImGuiTableColumnFlags.WidthFixed, 50)
+            ImGui.TableSetupColumn("Mana", ImGuiTableColumnFlags.WidthFixed, 50)
+            ImGui.TableSetupColumn("Class", ImGuiTableColumnFlags.WidthFixed, 80)
+            ImGui.TableSetupColumn("Comparison", ImGuiTableColumnFlags.WidthFixed, 100)
+            ImGui.TableHeadersRow()
+            
+            -- First, show the bot's current item
+            ImGui.TableNextRow()
+            ImGui.PushID("BotCurrentItem")
+            
+            ImGui.TableNextColumn()
+            local botItemLabel = (botItem.name or "Unknown") .. "##BotItem"
+            if ImGui.Selectable(botItemLabel) then
+                local links = mq.ExtractLinks(botItem.itemlink)
+                if links and #links > 0 and mq.ExecuteTextLink then
+                    mq.ExecuteTextLink(links[1])
+                end
+            end
+            
+            ImGui.TableNextColumn()
+            ImGui.TextColored(0.9, 0.5, 0.1, 1.0, "BOT")
+            
+            ImGui.TableNextColumn()
+            if botItem.icon and botItem.icon > 0 then
+                drawItemIcon(botItem.icon, 24, 24)
+            else
+                ImGui.Text("-")
+            end
+            
+            ImGui.TableNextColumn()
+            ImGui.TextColored(0.9, 0.75, 0.3, 1.0, tostring(botItem.ac or 0))
+            
+            ImGui.TableNextColumn()
+            ImGui.TextColored(0.3, 0.85, 0.3, 1.0, tostring(botItem.hp or 0))
+            
+            ImGui.TableNextColumn()
+            ImGui.TextColored(0.3, 0.6, 1.0, 1.0, tostring(botItem.mana or 0))
+            
+            ImGui.TableNextColumn()
+            ImGui.Text(botItem.classes or "Unknown")
+            
+            ImGui.TableNextColumn()
+            ImGui.Text("--")
+            
+            ImGui.PopID()
+            
+            -- Now show local character items
+            for i, item in ipairs(botUI.localCompareItems) do
+                ImGui.TableNextRow()
+                ImGui.PushID(string.format("LocalItem_%d", i))
+                
+                ImGui.TableNextColumn()
+                local itemLabel = (item.name or "Unknown") .. "##LocalItem" .. i
+                if ImGui.Selectable(itemLabel) then
+                    local links = mq.ExtractLinks(item.itemlink)
+                    if links and #links > 0 and mq.ExecuteTextLink then
+                        mq.ExecuteTextLink(links[1])
+                    end
+                end
+                
+                ImGui.TableNextColumn()
+                local source = item.source == "equipped" and "Worn" or 
+                              (item.sourceBag and "Bag " .. item.sourceBag or "Bag")
+                ImGui.Text(source)
+                
+                ImGui.TableNextColumn()
+                if item.icon and item.icon > 0 then
+                    drawItemIcon(item.icon, 24, 24)
+                else
+                    ImGui.Text("-")
+                end
+                
+                -- Compare AC values
+                ImGui.TableNextColumn()
+                local acDiff = (item.ac or 0) - (botItem.ac or 0)
+                if acDiff > 0 then
+                    ImGui.TextColored(0.0, 0.9, 0.0, 1.0, string.format("+%d", acDiff))
+                elseif acDiff < 0 then
+                    ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(acDiff))
+                else
+                    ImGui.Text(tostring(item.ac or 0))
+                end
+                
+                -- Compare HP values
+                ImGui.TableNextColumn()
+                local hpDiff = (item.hp or 0) - (botItem.hp or 0)
+                if hpDiff > 0 then
+                    ImGui.TextColored(0.0, 0.9, 0.0, 1.0, string.format("+%d", hpDiff))
+                elseif hpDiff < 0 then
+                    ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(hpDiff))
+                else
+                    ImGui.Text(tostring(item.hp or 0))
+                end
+                
+                -- Compare Mana values
+                ImGui.TableNextColumn()
+                local manaDiff = (item.mana or 0) - (botItem.mana or 0)
+                if manaDiff > 0 then
+                    ImGui.TextColored(0.0, 0.9, 0.0, 1.0, string.format("+%d", manaDiff))
+                elseif manaDiff < 0 then
+                    ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(manaDiff))
+                else
+                    ImGui.Text(tostring(item.mana or 0))
+                end
+                
+                -- Show Class compatibility
+                ImGui.TableNextColumn()
+                ImGui.Text(item.classes or "Unknown")
+                
+                -- Overall comparison
+                ImGui.TableNextColumn()
+                local totalDiff = acDiff + hpDiff + manaDiff
+                if totalDiff > 0 then
+                    ImGui.TextColored(0.0, 0.9, 0.0, 1.0, "Better")
+                elseif totalDiff < 0 then
+                    ImGui.TextColored(0.9, 0.0, 0.0, 1.0, "Worse")
+                else
+                    ImGui.Text("Same")
+                end
+                
+                ImGui.PopID()
+            end
+            
+            ImGui.EndTable()
+        end
+        
+        ImGui.Spacing()
+        ImGui.Separator()
+        
+        if ImGui.Button("Close", 120, 0) then
+            botUI.showLocalCompareWindow = false
+            botUI.rightClickedBotItem = nil
+        end
+        
+    end -- shouldShow
+    
+    ImGui.End()
+end
+
+local function drawAugmentTab(equippedItems)
+    local flags = ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable
+    if ImGui.BeginTable('BotAugmentTable', 8, flags) then
+        ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 110)
+        ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
+        for augIndex = 1, 6 do
+            ImGui.TableSetupColumn(string.format('Aug %d', augIndex), ImGuiTableColumnFlags.WidthStretch)
+        end
+        ImGui.TableHeadersRow()
+
+        for _, item in ipairs(equippedItems or {}) do
+            ImGui.TableNextRow()
+            ImGui.PushID(string.format('aug_row_%s', tostring(item.slotid or 'unknown')))
+
+            local slotName = getSlotName(item.slotid)
+            ImGui.TableNextColumn()
+            ImGui.Text(slotName)
+
+            ImGui.TableNextColumn()
+            local iconId = tonumber(item.icon or item.iconID or item.IconID or 0) or 0
+            if iconId > 0 then
+                drawItemIcon(iconId, 24, 24)
+                ImGui.SameLine(0, 6)
+            end
+            local itemLabel = string.format('%s##aug_item_%s', item.name or 'Unknown Item', tostring(item.slotid or 'unknown'))
+            if ImGui.Selectable(itemLabel, false) then
+                local links = mq.ExtractLinks(item.itemlink)
+                if links and #links > 0 and mq.ExecuteTextLink then
+                    mq.ExecuteTextLink(links[1])
+                end
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.BeginTooltip()
+                ImGui.Text(item.name or 'Unknown Item')
+                ImGui.Text(string.format('Slot: %s', slotName))
+                ImGui.EndTooltip()
+            end
+
+            for augIndex = 1, 6 do
+                ImGui.TableNextColumn()
+                local augName = item['aug' .. augIndex .. 'Name']
+                local augLink = item['aug' .. augIndex .. 'link']
+                local augIcon = tonumber(item['aug' .. augIndex .. 'Icon']
+                    or item['aug' .. augIndex .. 'icon']
+                    or item['aug' .. augIndex .. 'IconID']
+                    or 0) or 0
+
+                if augName and augName ~= '' then
+                    if augIcon > 0 then
+                        drawItemIcon(augIcon, 20, 20)
+                        ImGui.SameLine(0, 4)
+                    end
+                    local augLabel = string.format('%s##aug_slot_%d_%s', augName, augIndex, tostring(item.slotid or 'unknown'))
+                    if augLink and augLink ~= '' then
+                        if ImGui.Selectable(augLabel, false) then
+                            local links = mq.ExtractLinks(augLink)
+                            if links and #links > 0 and mq.ExecuteTextLink then
+                                mq.ExecuteTextLink(links[1])
+                            else
+                                print(' No aug link found in the database.')
+                            end
+                        end
+                    else
+                        ImGui.Text(augName)
+                    end
+
+                    if ImGui.IsItemHovered() then
+                        ImGui.BeginTooltip()
+                        ImGui.Text(string.format('Augment: %s', augName))
+                        ImGui.Text(string.format('Slot %d', augIndex))
+                        ImGui.EndTooltip()
+                    end
+                else
+                    ImGui.PushStyleColor(ImGuiCol.Text, 0.55, 0.55, 0.55, 0.8)
+                    ImGui.Text('--')
+                    ImGui.PopStyleColor()
+                end
+            end
+
+            ImGui.PopID()
+        end
+
+        ImGui.EndTable()
+    else
+        ImGui.Text('No augment data available. Scan equipment to populate augments.')
+    end
+end
+
+local function drawVisualTab(equippedItems)
+    local slotLayout = getEquippedSlotLayout()
+    local slotMap = {}
+    for _, it in ipairs(equippedItems or {}) do
+        local slotId = tonumber(it.slotid)
+        if slotId then slotMap[slotId] = it end
+    end
+
+    local cellSize = 48
+    local gridWidth = (cellSize + 4) * 4
+
+    if ImGui.BeginTable('BotEquipLayout', 2, ImGuiTableFlags.Resizable + ImGuiTableFlags.SizingStretchProp) then
+        ImGui.TableSetupColumn('BotGrid', ImGuiTableColumnFlags.WidthFixed, gridWidth)
+        ImGui.TableSetupColumn('BotCompare', ImGuiTableColumnFlags.WidthStretch)
+        ImGui.TableNextRow()
+        ImGui.TableNextColumn()
+        if ImGui.BeginTable('BotEquippedVisual', 4,
+            ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.SizingFixedFit) then
+            for _, row in ipairs(slotLayout) do
+                ImGui.TableNextRow(ImGuiTableRowFlags.None, cellSize + 6)
+                for _, slotEntry in ipairs(row) do
+                    ImGui.TableNextColumn()
+                    if slotEntry ~= '' then
+                        local slotId = tonumber(slotEntry) or 0
+                        local slotName = getSlotName(slotId)
+                        local item = slotMap[slotId]
+                        ImGui.PushID(string.format('bot_vis_%s_%s', botUI.selectedBot and botUI.selectedBot.name or 'unknown', tostring(slotId)))
+
+                        local clicked = ImGui.InvisibleButton('##btn', cellSize, cellSize)
+                        local rightClicked = ImGui.IsItemClicked(ImGuiMouseButton.Right)
+                        local minX, minY = ImGui.GetItemRectMin()
+                        ImGui.SetCursorScreenPos(minX + 2, minY + 2)
+
+                        if item and item.icon and item.icon > 0 then
+                            drawItemIcon(item.icon, cellSize - 4, cellSize - 4)
+                        else
+                            local textWidth = ImGui.CalcTextSize(slotName)
+                            local centerX = minX + (cellSize - textWidth) * 0.5
+                            local centerY = minY + (cellSize - ImGui.GetTextLineHeight()) * 0.5
+                            ImGui.SetCursorScreenPos(centerX, centerY)
+                            ImGui.PushStyleColor(ImGuiCol.Text, 0.7, 0.7, 0.7, 1.0)
+                            ImGui.Text(slotName)
+                            ImGui.PopStyleColor()
+                        end
+
+                        if clicked then
+                            botUI.selectedBotSlotID = slotId
+                            botUI.selectedBotSlotName = slotName
+                        end
+
+                        if item and rightClicked then
+                            local links = mq.ExtractLinks(item.itemlink)
+                            if links and #links > 0 and mq.ExecuteTextLink then
+                                mq.ExecuteTextLink(links[1])
+                            end
+                        end
+
+                        if ImGui.IsItemHovered() then
+                            ImGui.BeginTooltip()
+                            ImGui.Text(slotName)
+                            if item then
+                                ImGui.Text(item.name or 'Unknown Item')
+                                ImGui.Text(string.format('AC:%d  HP:%d  Mana:%d', tonumber(item.ac or 0), tonumber(item.hp or 0), tonumber(item.mana or 0)))
+                                if item.icon and item.icon > 0 then
+                                    ImGui.Text('Icon: ' .. tostring(item.icon))
+                                end
+                            else
+                                ImGui.Text('(Empty)')
+                            end
+                            ImGui.EndTooltip()
+                        end
+
+                        ImGui.PopID()
+                    else
+                        ImGui.Dummy(cellSize, cellSize)
+                    end
+                end
+            end
+            ImGui.EndTable()
+        end
+
+        ImGui.TableNextColumn()
+        ImGui.BeginChild('BotComparisonColumn', 0, 0)
+
+        if botUI.selectedBotSlotID then
+            local slotName = botUI.selectedBotSlotName or getSlotName(botUI.selectedBotSlotID)
+            local slotResults = collectBotSlotItems(botUI.selectedBotSlotID)
+            ImGui.Separator()
+            ImGui.Text(string.format('Slot %s across bots', slotName or tostring(botUI.selectedBotSlotID)))
+            ImGui.SameLine()
+            if ImGui.SmallButton('Clear##BotSlotSelection') then
+                botUI.selectedBotSlotID = nil
+                botUI.selectedBotSlotName = nil
+                slotResults = {}
+            end
+            ImGui.SameLine()
+            if ImGui.SmallButton('Scan Items##BotSlotScan') then
+                local seen = {}
+                local pending = {}
+                local allItems = {}
+                for _, entry in ipairs(slotResults) do
+                    local item = entry.item
+                    if item and item.itemlink and item.itemlink ~= '' then
+                        local key = tostring(item)
+                        if not seen[key] then
+                            seen[key] = true
+                            table.insert(allItems, item)
+                            local missing = (not item.ac and not item.hp and not item.mana)
+                                or ((tonumber(item.ac or 0) == 0)
+                                    and (tonumber(item.hp or 0) == 0)
+                                    and (tonumber(item.mana or 0) == 0))
+                            if missing then
+                                table.insert(pending, item)
+                            end
+                        end
+                    end
+                end
+                local toScan = pending
+                if #toScan == 0 then
+                    toScan = allItems
+                end
+                for _, item in ipairs(toScan) do
+                    botUI.enqueueItemScan(item)
+                end
+                printf('Queued scan for %d slot item(s) in %s', #toScan, slotName or tostring(botUI.selectedBotSlotID))
+            end
+            if #slotResults == 0 then
+                ImGui.Text('No bot data available for this slot yet.')
+            else
+                if ImGui.BeginTable('BotSlotComparison', 6,
+                    ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+                    ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
+                    ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
+                    ImGui.TableSetupColumn('Icon', ImGuiTableColumnFlags.WidthFixed, 48)
+                    ImGui.TableSetupColumn('AC', ImGuiTableColumnFlags.WidthFixed, 50)
+                    ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 50)
+                    ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 50)
+                    ImGui.TableHeadersRow()
+
+                    for _, entry in ipairs(slotResults) do
+                        ImGui.TableNextRow()
+                        ImGui.TableNextColumn()
+                        ImGui.Text(entry.bot or 'Unknown')
+
+                        ImGui.TableNextColumn()
+                        if entry.item then
+                            local label = (entry.item.name or 'Unknown Item') .. '##' .. (entry.bot or 'unknown')
+                            local clicked = ImGui.Selectable(label)
+                            local rightClicked = ImGui.IsItemClicked(ImGuiMouseButton.Right)
+                            
+                            if clicked then
+                                local links = mq.ExtractLinks(entry.item.itemlink)
+                                if links and #links > 0 and mq.ExecuteTextLink then
+                                    mq.ExecuteTextLink(links[1])
+                                end
+                            elseif rightClicked then
+                                -- Right-click detected - scan local inventory for compatible items
+                                botUI.rightClickedBotItem = entry.item
+                                local slotId = entry.item.slotid
+                                botUI.localCompareItems = botUI.findLocalItemsForSlot(slotId, entry.item, entry.bot)
+                                botUI.showLocalCompareWindow = true
+                                printf('[EmuBot] Found %d local items compatible with %s slot', #botUI.localCompareItems, getSlotName(slotId) or 'unknown')
+                            end
+                        else
+                            ImGui.Text('-')
+                        end
+
+                        ImGui.TableNextColumn()
+                        if entry.item and entry.item.icon and entry.item.icon > 0 then
+                            drawItemIcon(entry.item.icon, 24, 24)
+                        else
+                            ImGui.Text('-')
+                        end
+
+                        ImGui.TableNextColumn()
+                        if entry.item then
+                            ImGui.TextColored(0.9, 0.75, 0.3, 1.0, tostring(entry.item.ac or 0))
+                        else
+                            ImGui.Text('-')
+                        end
+
+                        ImGui.TableNextColumn()
+                        if entry.item then
+                            ImGui.TextColored(0.3, 0.85, 0.3, 1.0, tostring(entry.item.hp or 0))
+                        else
+                            ImGui.Text('-')
+                        end
+
+                        ImGui.TableNextColumn()
+                        if entry.item then
+                            ImGui.TextColored(0.3, 0.6, 1.0, 1.0, tostring(entry.item.mana or 0))
+                        else
+                            ImGui.Text('-')
+                        end
+                    end
+
+                    ImGui.EndTable()
+                end
+            end
+        end
+
+        ImGui.EndChild()
+        ImGui.EndTable()
+    end
+end
+
+local function drawTableTab(equippedItems)
+    if ImGui.BeginTable('BotEquippedTable', 7,
+        ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+        ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 100)
+        ImGui.TableSetupColumn('Icon ID', ImGuiTableColumnFlags.WidthFixed, 80)
+        ImGui.TableSetupColumn('Item Name', ImGuiTableColumnFlags.WidthStretch)
+        ImGui.TableSetupColumn('AC', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 70)
+        ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 70)
+        ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 120)
+        ImGui.TableHeadersRow()
+
+        for _, item in ipairs(equippedItems or {}) do
+            ImGui.TableNextRow()
+            ImGui.PushID(string.format('bot_item_%s_%s', botUI.selectedBot and botUI.selectedBot.name or 'unknown', item.slotid or 'unknown'))
+
+            local slotName = getSlotName(item.slotid)
+            ImGui.TableNextColumn()
+            ImGui.Text(slotName)
+
+            ImGui.TableNextColumn()
+            local iconId = tonumber(item.icon or item.iconID or 0) or 0
+            if iconId > 0 then
+                ImGui.Text(tostring(iconId))
+            else
+                ImGui.Text('-')
+            end
+
+            ImGui.TableNextColumn()
+            local itemName = item.name or 'Unknown Item'
+            if ImGui.Selectable(itemName) then
+                local links = mq.ExtractLinks(item.itemlink)
+                if links and #links > 0 then
+                    mq.ExecuteTextLink(links[1])
+                else
+                    print(' No item link found in the database.')
+                end
+            end
+
+            if ImGui.IsItemHovered() then
+                ImGui.BeginTooltip()
+                ImGui.Text('Item: ' .. itemName)
+                ImGui.Text('Slot ID: ' .. tostring(item.slotid))
+                ImGui.Text(string.format('AC: %s  HP: %s  Mana: %s', tostring(item.ac or 0), tostring(item.hp or 0), tostring(item.mana or 0)))
+                if item.itemlink and item.itemlink ~= '' then
+                    ImGui.Text('Has Link: YES')
+                else
+                    ImGui.Text('Has Link: NO')
+                end
+                if item.rawline then
+                    ImGui.Text('Has Raw Line: YES')
+                else
+                    ImGui.Text('Has Raw Line: NO')
+                end
+                ImGui.Text('Click to inspect item')
+                ImGui.EndTooltip()
+            end
+
+            ImGui.TableNextColumn()
+            ImGui.Text(tostring(item.ac or 0))
+            ImGui.TableNextColumn()
+            ImGui.Text(tostring(item.hp or 0))
+            ImGui.TableNextColumn()
+            ImGui.Text(tostring(item.mana or 0))
+
+            ImGui.TableNextColumn()
+            if (not item.ac or not item.hp or not item.mana)
+                or ((item.ac == 0) and (item.hp == 0) and (item.mana == 0)) then
+                if ImGui.Button('Scan##' .. tostring(item.slotid or 'unknown')) then
+                    botUI.enqueueItemScan(item)
+                end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Open ItemDisplay to scrape stats')
+                end
+                ImGui.SameLine()
+            end
+
+            if ImGui.Button('Unequip##' .. tostring(item.slotid or 'unknown')) then
+                if botUI.selectedBot and botUI.selectedBot.name and item.slotid then
+                    local botName = botUI.selectedBot.name
+                    local slotId = item.slotid
+
+                    enqueueTask(function()
+                        local botSpawn = mq.TLO.Spawn(string.format('= %s', botName))
+                        if botSpawn.ID() and botSpawn.ID() > 0 then
+                            mq.cmdf('/target id %d', botSpawn.ID())
+                            printf('Targeting %s for unequip...', botName)
+
+                            local maxAttempts = 10
+                            local attempts = 0
+                            local function targetCheckTask()
+                                if mq.TLO.Target.Name() == botName then
+                                    bot_inventory.requestBotUnequip(botName, slotId)
+                                    return true
+                                elseif mq.TLO.Target.ID() == 0 then
+                                    mq.cmdf('/target "%s"', botName)
+                                    return false
+                                elseif mq.TLO.Target.Name() ~= botName then
+                                    print('Could not target bot')
+                                    return true
+                                end
+                                return false
+                            end
+
+                            local function queueTargetCheck()
+                                enqueueTask(function()
+                                    attempts = attempts + 1
+                                    if targetCheckTask() then
+                                        return true
+                                    end
+
+                                    if attempts < maxAttempts then
+                                        queueTargetCheck()
+                                    else
+                                        print('Timeout targeting bot for unequip')
+                                    end
+                                    return true
+                                end)
+                            end
+
+                            queueTargetCheck()
+                        else
+                            print('Could not find bot spawn for unequip command')
+                        end
+                    end)
+
+                    printf('Queued unequip request for %s slot %s', botName, slotId)
+                end
+            end
+
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Unequip this item from the bot')
+            end
+
+            ImGui.PopID()
+        end
+
+        ImGui.EndTable()
+    end
+end
+
+function botUI.drawBotInventoryWindow()
+    if not botUI.showWindow then return end
+
+    syncSelectedBotData()
+
+    local equippedItems = {}
+    if botUI.selectedBot and botUI.selectedBot.data and botUI.selectedBot.data.equipped then
+        equippedItems = botUI.selectedBot.data.equipped
+    end
+
+    ImGui.SetNextWindowSize(ImVec2(600, 400), ImGuiCond.FirstUseEver)
+    local isOpen, shouldShow = ImGui.Begin('Bot Inventory Viewer##EmuBot', true, ImGuiWindowFlags.None)
+    if not isOpen then
+        botUI.showWindow = false
+        botUI.selectedBot = nil
+        botUI.selectedBotSlotID = nil
+        botUI.selectedBotSlotName = nil
+        ImGui.End()
+        return
+    end
+
+    if shouldShow then
+        local windowWidth = ImGui.GetWindowWidth()
+        local botList = collectBotNames()
+        local currentBotName = botUI.selectedBot and botUI.selectedBot.name or ''
+        local comboLabel = currentBotName ~= '' and currentBotName or (#botList > 0 and 'Select Bot' or 'No Bots')
+
+        -- Controls row: refresh / clear buttons then selector
+        if ImGui.Button('Refresh Bot List') then
+            refreshBotList()
+        end
+        ImGui.SameLine()
+        if ImGui.Button('Clear Bot Cache') then
+            if bot_inventory then
+                bot_inventory.bot_inventories = {}
+                bot_inventory.cached_bot_list = {}
+                bot_inventory.bot_list_capture_set = {}
+            end
+            botUI.selectedBot = nil
+        end
+
+        ImGui.SameLine()
+        ImGui.Text('Viewing bot:')
+        ImGui.SameLine()
+        ImGui.SetNextItemWidth(math.max(150, math.min(windowWidth * 0.35, 250)))
+        if #botList > 0 then
+            
+            -- Find current bot index for combo
+            local currentBotIndex = -1  -- Start with -1 (no selection)
+            for i, botName in ipairs(botList) do
+                if botName == currentBotName then
+                    currentBotIndex = i  -- ImGui.Combo uses 0-based indexing
+                    break
+                end
+            end
+                        
+            -- Use simple ImGui.Combo with standard 0-based indexing
+            local selectedIndex, changed = ImGui.Combo('##BotInventorySelect', currentBotIndex, botList)
+            
+            -- Process selection when changed
+            if changed and selectedIndex >= 0 and selectedIndex < #botList then
+                -- Test different index interpretations
+                local directIndex = selectedIndex  -- Standard 0-based to 1-based conversion
+                local correctedIndex = selectedIndex    -- Use selectedIndex directly as 1-based
+                
+                -- Use direct conversion for now, but log both for comparison
+                local luaIndex = directIndex
+                local botName = botList[luaIndex]
+                
+                -- Validate the bot name exists in the list
+                if not botName or botName == '' then
+                    -- Try the alternative indexing as fallback
+                    luaIndex = correctedIndex
+                    botName = botList[luaIndex]
+                    if not botName or botName == '' then
+                        return
+                    else
+                        printf('[EmuBot] Fallback indexing worked: %d -> "%s"', luaIndex, botName)
+                    end
+                end
+                                
+                -- Always process the selection, even if it's the same bot (for refresh purposes)
+                local botData = bot_inventory and bot_inventory.getBotInventory and bot_inventory.getBotInventory(botName)
+                
+                if (not botData or not botData.equipped) then
+                    botUI._enqueueBotInventoryFetch(botName)
+                end
+                botUI.selectedBot = { name = botName }
+                if botData then
+                    botUI.selectedBot.data = botData
+                else
+                    syncSelectedBotData()
+                    botData = botUI.selectedBot and botUI.selectedBot.data or nil
+                end
+                botUI.selectedBotSlotID = nil
+                botUI.selectedBotSlotName = nil
+                equippedItems = (botData and botData.equipped) or {}
+                currentBotName = botName
+                comboLabel = botName
+            elseif changed then
+                printf('[EmuBot] Warning: Invalid bot selection index %d (list size: %d)', selectedIndex, #botList)
+            end
+        else
+            ImGui.Text(comboLabel)
+        end
+
+        local buttonWidth = 140
+        local buttonSpacing = ImGui.GetStyle().ItemSpacing.x
+        local buttonCount = 3
+        local totalButtonWidth = buttonWidth * buttonCount + buttonSpacing * (buttonCount - 1)
+
+        ImGui.SameLine()
+        ImGui.SetCursorPosX(math.max(0, windowWidth - totalButtonWidth - 10))
+
+        if ImGui.Button('Refresh Inventory', buttonWidth, 0) then
+            if botUI.selectedBot and botUI.selectedBot.name then
+                bot_inventory.requestBotInventory(botUI.selectedBot.name)
+                printf('Refreshing inventory for bot: %s', botUI.selectedBot.name)
+            end
+        end
+
+        ImGui.SameLine()
+
+        if ImGui.Button('Scan Selected Bot', buttonWidth, 0) then
+            local itemsToScan = {}
+            for _, it in ipairs(equippedItems or {}) do
+                local missing = (not it.ac and not it.hp and not it.mana)
+                    or ((it.ac or 0) == 0 and (it.hp or 0) == 0 and (it.mana or 0) == 0)
+                if missing then
+                    table.insert(itemsToScan, it)
+                end
+            end
+            if #itemsToScan == 0 then itemsToScan = equippedItems or {} end
+            for _, it in ipairs(itemsToScan) do
+                botUI.enqueueItemScan(it)
+            end
+            printf('Queued scan for %d item(s)', #itemsToScan)
+        end
+
+        ImGui.SameLine()
+
+        if ImGui.Button('Close Window', buttonWidth, 0) then
+            botUI.showWindow = false
+            botUI.selectedBot = nil
+            botUI.selectedBotSlotID = nil
+            botUI.selectedBotSlotName = nil
+            ImGui.End()
+            return
+        end
+        
+        ImGui.Separator()
+
+        ImGui.Text('Export Data:')
+        ImGui.SameLine()
+
+        if ImGui.Button('Export JSON', buttonWidth, 0) then
+            if bot_inventory and bot_inventory.exportBotInventories then
+                local ok, result = bot_inventory.exportBotInventories('json')
+                if ok then
+                    botUI.lastExportWasSuccess = true
+                    botUI.lastExportMessage = string.format('Exported JSON to %s', tostring(result))
+                    printf('[EmuBot] Exported JSON inventory snapshot to %s', tostring(result))
+                else
+                    botUI.lastExportWasSuccess = false
+                    botUI.lastExportMessage = string.format('Export failed: %s', tostring(result))
+                    printf('[EmuBot] Export to JSON failed: %s', tostring(result))
+                end
+            end
+        end
+
+        ImGui.SameLine()
+
+        if ImGui.Button('Export CSV', buttonWidth, 0) then
+            if bot_inventory and bot_inventory.exportBotInventories then
+                local ok, result = bot_inventory.exportBotInventories('csv')
+                if ok then
+                    botUI.lastExportWasSuccess = true
+                    botUI.lastExportMessage = string.format('Exported CSV to %s', tostring(result))
+                    printf('[EmuBot] Exported CSV inventory snapshot to %s', tostring(result))
+                else
+                    botUI.lastExportWasSuccess = false
+                    botUI.lastExportMessage = string.format('Export failed: %s', tostring(result))
+                    printf('[EmuBot] Export to CSV failed: %s', tostring(result))
+                end
+            end
+        end
+
+        ImGui.SameLine()
+
+        -- Scan All Bots section
+        ImGui.Text('Bulk Operations:')
+        ImGui.SameLine()
+        
+        if not botUI._scanAllActive then
+            if ImGui.Button('Scan All Bots', buttonWidth, 0) then
+                botUI.startScanAllBots()
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Spawn all bots, gather their inventory data, then camp them')
+            end
+        else
+            if ImGui.Button('Cancel Scan', buttonWidth, 0) then
+                botUI.stopScanAllBots()
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Stop the current scan all bots operation')
+            end
+        end
+        
+        -- Show progress if scan is active
+        if botUI._scanAllActive and botUI._scanAllProgress and botUI._scanAllProgress ~= '' then
+            ImGui.SameLine()
+            ImGui.TextColored(0.3, 0.85, 0.3, 1.0, botUI._scanAllProgress)
+        end
+        
+        -- Show item scanning queue status
+        if #botUI._scanQueue > 0 then
+            ImGui.SameLine()
+            ImGui.TextColored(0.3, 0.6, 1.0, 1.0, string.format('(%d items scanning)', #botUI._scanQueue))
+        end
+
+        if botUI.lastExportMessage then
+            local message = botUI.lastExportMessage
+            if botUI.lastExportWasSuccess then
+                ImGui.Text(message)
+            else
+                ImGui.TextWrapped(message)
+            end
+        end
+
+        ImGui.Separator()
+
+        if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
+            if ImGui.BeginTabItem('Visual') then
+                drawVisualTab(equippedItems)
+                ImGui.EndTabItem()
+            end
+
+            if ImGui.BeginTabItem('Table') then
+                drawTableTab(equippedItems)
+                ImGui.EndTabItem()
+            end
+
+            if ImGui.BeginTabItem('Augments') then
+                drawAugmentTab(equippedItems)
+                ImGui.EndTabItem()
+            end
+
+            if ImGui.BeginTabItem('Settings') then
+                local res1, res2 = ImGui.SliderFloat('Fetch Interval (sec)##BotFetchDelay', botUI.botFetchDelay, 0.1, 5.0, '%.1f')
+                if type(res1) == 'boolean' then
+                    if res1 then
+                        botUI.botFetchDelay = math.max(0.1, tonumber(res2) or botUI.botFetchDelay)
+                        botUI._botInventoryLastAttempt = {}
+                        enqueueTask(botUI._processBotInventoryQueue)
+                    end
+                else
+                    local newDelay = tonumber(res1) or botUI.botFetchDelay
+                    if math.abs(newDelay - botUI.botFetchDelay) > 0.0001 then
+                        botUI.botFetchDelay = math.max(0.1, newDelay)
+                        botUI._botInventoryLastAttempt = {}
+                        botUI._botInventoryFetchQueue = {}
+                        botUI._botInventoryFetchSet = {}
+                    end
+                end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Time to wait between bot inventory requests')
+                end
+
+                local sRes1, sRes2 = ImGui.SliderFloat('Spawn Delay (sec)##BotSpawnDelay', botUI.botSpawnDelay, 0.1, 5.0, '%.1f')
+                if type(sRes1) == 'boolean' then
+                    if sRes1 then
+                        botUI.botSpawnDelay = math.max(0.1, tonumber(sRes2) or botUI.botSpawnDelay)
+                    end
+                else
+                    local newSpawn = tonumber(sRes1) or botUI.botSpawnDelay
+                    if math.abs(newSpawn - botUI.botSpawnDelay) > 0.0001 then
+                        botUI.botSpawnDelay = math.max(0.1, newSpawn)
+                    end
+                end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Delay after spawning before targeting the bot')
+                end
+
+                local tRes1, tRes2 = ImGui.SliderFloat('Target Delay (sec)##BotTargetDelay', botUI.botTargetDelay, 0.1, 5.0, '%.1f')
+                if type(tRes1) == 'boolean' then
+                    if tRes1 then
+                        botUI.botTargetDelay = math.max(0.1, tonumber(tRes2) or botUI.botTargetDelay)
+                    end
+                else
+                    local newTarget = tonumber(tRes1) or botUI.botTargetDelay
+                    if math.abs(newTarget - botUI.botTargetDelay) > 0.0001 then
+                        botUI.botTargetDelay = math.max(0.1, newTarget)
+                    end
+                end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Delay after targeting before requesting inventory')
+                end
+                
+                ImGui.Separator()
+                ImGui.Text('Bot Failure Management')
+                
+                -- Failure settings
+                local maxRes1, maxRes2 = ImGui.SliderInt('Max Failures##MaxFailures', botUI._maxFailures, 1, 10)
+                if type(maxRes1) == 'boolean' then
+                    if maxRes1 then
+                        botUI._maxFailures = math.max(1, tonumber(maxRes2) or botUI._maxFailures)
+                    end
+                else
+                    local newMax = tonumber(maxRes1) or botUI._maxFailures
+                    if newMax ~= botUI._maxFailures then
+                        botUI._maxFailures = math.max(1, newMax)
+                    end
+                end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Maximum failures before skipping a bot')
+                end
+                
+                local timeRes1, timeRes2 = ImGui.SliderInt('Skip Timeout (sec)##SkipTimeout', botUI._failureTimeout, 60, 1800)
+                if type(timeRes1) == 'boolean' then
+                    if timeRes1 then
+                        botUI._failureTimeout = math.max(60, tonumber(timeRes2) or botUI._failureTimeout)
+                    end
+                else
+                    local newTimeout = tonumber(timeRes1) or botUI._failureTimeout
+                    if newTimeout ~= botUI._failureTimeout then
+                        botUI._failureTimeout = math.max(60, newTimeout)
+                    end
+                end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Seconds to skip a failed bot before allowing retry')
+                end
+                
+                -- Show skipped bots
+                local skippedBots = botUI.getSkippedBots()
+                if #skippedBots > 0 then
+                    ImGui.Spacing()
+                    ImGui.Text(string.format('Skipped Bots (%d):', #skippedBots))
+                    
+                    if ImGui.BeginTable('SkippedBotsTable', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg) then
+                        ImGui.TableSetupColumn('Bot Name', ImGuiTableColumnFlags.WidthStretch)
+                        ImGui.TableSetupColumn('Failures', ImGuiTableColumnFlags.WidthFixed, 60)
+                        ImGui.TableSetupColumn('Time Left', ImGuiTableColumnFlags.WidthFixed, 80)
+                        ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 80)
+                        ImGui.TableHeadersRow()
+                        
+                        for i, bot in ipairs(skippedBots) do
+                            ImGui.TableNextRow()
+                            
+                            ImGui.TableNextColumn()
+                            ImGui.Text(bot.name)
+                            
+                            ImGui.TableNextColumn()
+                            ImGui.Text(tostring(bot.failures))
+                            
+                            ImGui.TableNextColumn()
+                            if bot.remaining > 0 then
+                                local minutes = math.floor(bot.remaining / 60)
+                                local seconds = bot.remaining % 60
+                                ImGui.Text(string.format('%dm %ds', minutes, seconds))
+                            else
+                                ImGui.TextColored(0.0, 0.9, 0.0, 1.0, 'Ready')
+                            end
+                            
+                            ImGui.TableNextColumn()
+                            if ImGui.SmallButton('Retry##' .. bot.name) then
+                                botUI.unskipBot(bot.name)
+                            end
+                        end
+                        
+                        ImGui.EndTable()
+                    end
+                    
+                    if ImGui.Button('Clear All Skipped Bots') then
+                        botUI.clearAllSkippedBots()
+                    end
+                else
+                    ImGui.Text('No bots currently skipped')
+                end
+
+                ImGui.EndTabItem()
+            end
+
+            ImGui.EndTabBar()
+        end
+
+        ImGui.Spacing()
+        ImGui.Text(string.format('Items: %d', #equippedItems))
+        local withLinks = 0
+        local withoutLinks = 0
+        for _, item in ipairs(equippedItems or {}) do
+            if item.itemlink and item.itemlink ~= '' then
+                withLinks = withLinks + 1
+            else
+                withoutLinks = withoutLinks + 1
+            end
+        end
+
+        ImGui.SameLine()
+        ImGui.Text(string.format('Links: %d/%d', withLinks, withLinks + withoutLinks))
+    end
+
+    ImGui.End()
+end
+
+local function drawFloatingToggle()
+    if not botUI.showFloatingToggle then return end
+
+    -- Position and minimal floating window
+    ImGui.SetNextWindowPos(ImVec2(botUI.floatingPosX, botUI.floatingPosY), ImGuiCond.FirstUseEver)
+    ImGui.SetNextWindowSize(ImVec2(botUI.floatingButtonSize + 8, botUI.floatingButtonSize + 8), ImGuiCond.FirstUseEver)
+
+    local flags = bit32.bor(
+        ImGuiWindowFlags.NoTitleBar,
+        ImGuiWindowFlags.NoResize,
+        ImGuiWindowFlags.NoScrollbar,
+        ImGuiWindowFlags.NoScrollWithMouse,
+        ImGuiWindowFlags.NoCollapse,
+        ImGuiWindowFlags.AlwaysAutoResize,
+        ImGuiWindowFlags.NoBackground,
+        ImGuiWindowFlags.NoDecoration
+    )
+
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, 4, 4)
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 1)
+    ImGui.PushStyleColor(ImGuiCol.WindowBg, 0.1, 0.1, 0.1, 0.85)
+    ImGui.PushStyleColor(ImGuiCol.Border, 0.4, 0.4, 0.4, 0.8)
+
+    if ImGui.Begin('EmuBotToggle', true, flags) then
+        -- Track position as it moves
+        local pos = ImGui.GetWindowPosVec()
+        if pos then
+            botUI.floatingPosX = pos.x
+            botUI.floatingPosY = pos.y
+        end
+
+        -- Choose colors based on current visibility (toggle-style)
+        if botUI.showWindow then
+            -- Open state: orange-ish
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.85, 0.55, 0.15, 0.95)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.95, 0.65, 0.25, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.75, 0.45, 0.10, 1.0)
+        else
+            -- Closed state: green
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.6, 0.2, 0.9)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.25, 0.7, 0.25, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.15, 0.5, 0.15, 1.0)
+        end
+
+        -- Rounded button corners
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, math.min(12, botUI.floatingButtonSize * 0.4))
+
+        if ImGui.Button('EB', ImVec2(botUI.floatingButtonSize, botUI.floatingButtonSize)) then
+            botUI.showWindow = not botUI.showWindow
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip(string.format('Toggle EmuBot (%s)', botUI.showWindow and 'Open' or 'Closed'))
+        end
+
+        ImGui.PopStyleVar(1)
+        ImGui.PopStyleColor(3)
+    end
+    ImGui.End()
+    ImGui.PopStyleColor(2)
+    ImGui.PopStyleVar(3)
+end
+
+function botUI.render()
+    -- Draw floating toggle even if main window is closed
+    drawFloatingToggle()
+    botUI.drawBotInventoryWindow()
+    
+    -- Draw the local comparison window if needed (separate window)
+    botUI.drawLocalComparisonWindow()
+end
+
+-- Bind a slash command to reopen the EmuBot UI
+mq.bind("/emubot", function(...)
+    local args = {...}
+    if #args > 0 then
+        local cmd = tostring(args[1] or ''):lower()
+        if cmd == 'on' or cmd == 'show' or cmd == 'open' then
+            botUI.showWindow = true
+            printf('[EmuBot] Window opened')
+        elseif cmd == 'off' or cmd == 'hide' or cmd == 'close' then
+            botUI.showWindow = false
+            printf('[EmuBot] Window closed')
+        elseif cmd == 'skip' and args[2] then
+            -- Skip a specific bot
+            local botName = tostring(args[2])
+            local reason = args[3] and tostring(args[3]) or 'Manual skip'
+            if botUI.skipBot(botName, reason) then
+                printf('[EmuBot] Skipped bot: %s', botName)
+            else
+                printf('[EmuBot] Failed to skip bot: %s', botName)
+            end
+        elseif cmd == 'unskip' and args[2] then
+            -- Unskip a specific bot
+            local botName = tostring(args[2])
+            if botUI.unskipBot(botName) then
+                printf('[EmuBot] Unskipped bot: %s', botName)
+            else
+                printf('[EmuBot] Bot %s was not in skip list', botName)
+            end
+        elseif cmd == 'clearskipped' or cmd == 'clearskip' then
+            -- Clear all skipped bots
+            local count = botUI.clearAllSkippedBots()
+            printf('[EmuBot] Cleared %d bots from skip list', count)
+        elseif cmd == 'listskipped' or cmd == 'skipped' then
+            -- List skipped bots
+            local skipped = botUI.getSkippedBots()
+            if #skipped > 0 then
+                printf('[EmuBot] Skipped bots (%d):', #skipped)
+                for _, bot in ipairs(skipped) do
+                    local timeStr = ''
+                    if bot.remaining > 0 then
+                        local minutes = math.floor(bot.remaining / 60)
+                        local seconds = bot.remaining % 60
+                        timeStr = string.format(' (%dm %ds remaining)', minutes, seconds)
+                    else
+                        timeStr = ' (ready for retry)'
+                    end
+                    printf('  %s - %d failures%s', bot.name, bot.failures, timeStr)
+                end
+            else
+                printf('[EmuBot] No bots currently skipped')
+            end
+        elseif cmd == 'testslot' and args[2] and args[3] then
+            -- Test item slot compatibility
+            local itemName = tostring(args[2])
+            local slotId = tonumber(args[3])
+            local className = args[4] and tostring(args[4]) or nil
+            if slotId then
+                botUI.debugItemSlotCompatibility(itemName, slotId, className)
+            else
+                printf('[EmuBot] Invalid slot ID: %s', tostring(args[3]))
+            end
+        elseif cmd == 'help' then
+            printf('[EmuBot] Available commands:')
+            printf('  /emubot [on|off] - Open/close the UI')
+            printf('  /emubot skip <botname> [reason] - Skip a bot')
+            printf('  /emubot unskip <botname> - Remove bot from skip list')
+            printf('  /emubot clearskipped - Clear all skipped bots')
+            printf('  /emubot listskipped - Show currently skipped bots')
+            printf('  /emubot testslot <itemname> <slotid> [class] - Test item/slot/class compatibility')
+            printf('  /emubot help - Show this help')
+        else
+            botUI.showWindow = not botUI.showWindow
+            printf('[EmuBot] Window %s', botUI.showWindow and 'opened' or 'closed')
+        end
+    else
+        botUI.showWindow = not botUI.showWindow
+        printf('[EmuBot] Window %s', botUI.showWindow and 'opened' or 'closed')
+    end
+end)
+
+mq.bind("/emubotbutton", function(...)
+    botUI.showFloatingToggle = not botUI.showFloatingToggle
+    printf('[EmuBot] Floating toggle %s', botUI.showFloatingToggle and 'enabled' or 'disabled')
+end)
+
+local function main()
+    if not bot_inventory.init() then
+        print('[EmuBot] Failed to initialize bot inventory system')
+        return
+    end
+    
+    -- Connect skip system to bot inventory module
+    bot_inventory.skipCheckFunction = function(botName)
+        return botUI._skippedBots[botName] ~= nil
+    end
+    
+    bot_inventory.onBotFailure = function(botName, reason)
+        local failCount = (botUI._botFailureCount[botName] or 0) + 1
+        botUI._botFailureCount[botName] = failCount
+        
+        printf('[EmuBot] Bot %s failed: %s (attempt %d/%d)', botName, reason, failCount, botUI._maxFailures)
+        
+        if failCount >= botUI._maxFailures then
+            printf('[EmuBot] Bot %s exceeded max failures, skipping for %d seconds', botName, botUI._failureTimeout)
+            botUI._skippedBots[botName] = os.time()
+            
+            -- Remove from current queues
+            for i = #botUI._botInventoryFetchQueue, 1, -1 do
+                if botUI._botInventoryFetchQueue[i] == botName then
+                    table.remove(botUI._botInventoryFetchQueue, i)
+                end
+            end
+            botUI._botInventoryFetchSet[botName] = nil
+        end
+    end
+
+    -- Kick off a bot list refresh on startup so the dropdown populates.
+    refreshBotList()
+
+    mq.imgui.init('EmuBot', function()
+        botUI.render()
+    end)
+
+    while true do
+        mq.doevents()
+        bot_inventory.process()
+        processDeferredTasks()
+        mq.delay(50)
+    end
+end
+
+main()
