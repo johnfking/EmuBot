@@ -1,6 +1,7 @@
 -- bot_inventory.lua
 local mq = require("mq")
 local json = require("dkjson")
+local db = require('EmuBot.modules.db')
 
 local BotInventory = {}
 BotInventory.bot_inventories = {}
@@ -17,6 +18,7 @@ BotInventory.bot_request_phase = 0
 BotInventory.bot_list_capture_set = {}
 BotInventory.invlist_issued_time = nil
 BotInventory._resources_dir = nil
+BotInventory._capture_count = {}
 
 local function normalizePathSeparators(path)
     return path and path:gsub('\\\\', '/') or nil
@@ -445,7 +447,7 @@ local function displayBotInventory(line, slotNum, slotName)
     if itemlink.text ~= "Empty" and itemlink.link ~= "N/A" then
         local parsedItem = BotInventory.parseItemLinkData(line)
         
-        local item = {
+        local newItem = {
             name = itemlink.text,
             slotid = tonumber(slotNum),
             slotname = slotName,
@@ -461,7 +463,25 @@ local function displayBotInventory(line, slotNum, slotName)
             qty = 1,
             nodrop = 1
         }
-        table.insert(BotInventory.bot_inventories[botName].equipped, item)
+        -- Merge behavior: replace per-slot, but preserve existing non-zero stats if new are zero
+        local eq = BotInventory.bot_inventories[botName].equipped
+        local replaced = false
+        for i = 1, #eq do
+            local it = eq[i]
+            if tonumber(it.slotid) == tonumber(slotNum) then
+                -- Preserve stats if new values are zero
+                if (newItem.ac or 0) == 0 and (it.ac or 0) ~= 0 then newItem.ac = it.ac end
+                if (newItem.hp or 0) == 0 and (it.hp or 0) ~= 0 then newItem.hp = it.hp end
+                if (newItem.mana or 0) == 0 and (it.mana or 0) ~= 0 then newItem.mana = it.mana end
+                if (newItem.icon or 0) == 0 and (it.icon or 0) ~= 0 then newItem.icon = it.icon end
+                eq[i] = newItem
+                replaced = true
+                break
+            end
+        end
+        if not replaced then table.insert(eq, newItem) end
+        -- Count capture lines for this request
+        BotInventory._capture_count[botName] = (BotInventory._capture_count[botName] or 0) + 1
 
         -- Debug output to track inventory storage (disabled to reduce spam)
         -- print(string.format("[BotInventory DEBUG] Stored item: %s (ID: %s, Icon: %s) in slot %s for bot %s", 
@@ -528,7 +548,8 @@ function BotInventory.requestBotInventory(botName)
         return false 
     end
 
-    BotInventory.bot_inventories[botName] = nil
+    -- Start request without destroying existing cache; track capture count for this request
+    BotInventory._capture_count[botName] = 0
     BotInventory.current_bot_request = botName
     BotInventory.bot_request_start_time = os.time()
     BotInventory.spawn_issued_time = nil
@@ -558,9 +579,48 @@ function BotInventory.processBotInventoryResponse()
             BotInventory.target_issued_time = nil
             return
         end
-        if BotInventory.bot_inventories[botName] and #BotInventory.bot_inventories[botName].equipped > 0 then
+        if (BotInventory._capture_count[botName] or 0) > 0 then
+            -- Check for mismatches with previously cached data
+            local oldData = nil
+            local newData = BotInventory.bot_inventories[botName]
+            
+            -- Try to get old data from database first
+            if db and db.load_all then
+                local dbData = db.load_all() or {}
+                oldData = dbData[botName]
+            end
+            
+            -- Compare and detect mismatches
+            if oldData and newData then
+                local mismatches = BotInventory.compareInventoryData(botName, oldData, newData)
+                if #mismatches > 0 then
+                    print(string.format("[BotInventory] Detected %d mismatched item(s) for %s, queueing for scan", #mismatches, botName))
+                    
+                    -- Queue mismatched items for scanning if scan callback is available
+                    if BotInventory.onMismatchDetected then
+                        for _, mismatch in ipairs(mismatches) do
+                            print(string.format("[BotInventory] Queueing %s (slot %s) for scan: %s", 
+                                mismatch.item.name or "unknown", 
+                                tostring(mismatch.slotId), 
+                                mismatch.reason))
+                            BotInventory.onMismatchDetected(mismatch.item, botName, mismatch.reason)
+                        end
+                    end
+                end
+            end
+            
+            -- Persist to SQLite before clearing request state
+            local meta = BotInventory.bot_list_capture_set and BotInventory.bot_list_capture_set[botName] or nil
+            local ok, err = db.save_bot_inventory(botName, BotInventory.bot_inventories[botName], meta)
+            if not ok then
+                print(string.format("[BotInventory][DB] Failed to save inventory for %s: %s", botName, tostring(err)))
+            else
+                --print(string.format("[BotInventory][DB] Saved inventory for %s", botName))
+            end
+
             --print(string.format("[BotInventory] Successfully captured inventory for %s (%d items)", botName, #BotInventory.bot_inventories[botName].equipped))
             BotInventory.current_bot_request = nil
+            BotInventory._capture_count[botName] = 0
             BotInventory.bot_request_start_time = nil
             BotInventory.bot_request_phase = 0
             BotInventory.spawn_issued_time = nil
@@ -630,13 +690,22 @@ local function displayBotUnequipResponse(line, slotNum, itemName)
     print(string.format("[BotInventory] %s unequipped %s from slot %s", botName, itemName or "item", slotNum or "unknown"))
     
     -- Remove the item from our cached inventory if we have it
-    if BotInventory.bot_inventories[botName] and BotInventory.bot_inventories[botName].equipped then
+if BotInventory.bot_inventories[botName] and BotInventory.bot_inventories[botName].equipped then
+        local removed = false
         for i = #BotInventory.bot_inventories[botName].equipped, 1, -1 do
             local item = BotInventory.bot_inventories[botName].equipped[i]
             if tonumber(item.slotid) == tonumber(slotNum) then
                 table.remove(BotInventory.bot_inventories[botName].equipped, i)
                 print(string.format("[BotInventory] Removed %s from cached inventory", item.name or "item"))
+                removed = true
                 break
+            end
+        end
+        if removed then
+            local meta = BotInventory.bot_list_capture_set and BotInventory.bot_list_capture_set[botName] or nil
+            local ok, err = db.save_bot_inventory(botName, BotInventory.bot_inventories[botName], meta)
+            if not ok then
+                print(string.format("[BotInventory][DB] Failed to persist after unequip for %s: %s", botName, tostring(err)))
             end
         end
     end
@@ -719,12 +788,101 @@ function BotInventory.getBotInventory(botName)
     return BotInventory.bot_inventories[botName]
 end
 
+-- Compare items and detect mismatches that need re-scanning
+function BotInventory.compareInventoryData(botName, oldData, newData)
+    if not oldData or not newData then return {} end
+    if not oldData.equipped or not newData.equipped then return {} end
+    
+    local mismatches = {}
+    local oldBySlot = {}
+    local newBySlot = {}
+    
+    -- Index old items by slot ID
+    for _, item in ipairs(oldData.equipped) do
+        if item.slotid then
+            oldBySlot[tonumber(item.slotid)] = item
+        end
+    end
+    
+    -- Index new items by slot ID
+    for _, item in ipairs(newData.equipped) do
+        if item.slotid then
+            newBySlot[tonumber(item.slotid)] = item
+        end
+    end
+    
+    -- Compare items in each slot
+    for slotId, newItem in pairs(newBySlot) do
+        local oldItem = oldBySlot[slotId]
+        local needsScan = false
+        local reason = ""
+        
+        if not oldItem then
+            -- New item in this slot
+            needsScan = (not newItem.ac or tonumber(newItem.ac) == 0) and
+                       (not newItem.hp or tonumber(newItem.hp) == 0) and
+                       (not newItem.mana or tonumber(newItem.mana) == 0)
+            reason = "new item with missing stats"
+        elseif oldItem.name ~= newItem.name or oldItem.itemID ~= newItem.itemID then
+            -- Different item in the same slot
+            needsScan = (not newItem.ac or tonumber(newItem.ac) == 0) and
+                       (not newItem.hp or tonumber(newItem.hp) == 0) and
+                       (not newItem.mana or tonumber(newItem.mana) == 0)
+            reason = string.format("item changed from '%s' to '%s'", oldItem.name or "unknown", newItem.name or "unknown")
+        else
+            -- Same item, check for stat mismatches
+            local oldAC = tonumber(oldItem.ac) or 0
+            local oldHP = tonumber(oldItem.hp) or 0
+            local oldMana = tonumber(oldItem.mana) or 0
+            local newAC = tonumber(newItem.ac) or 0
+            local newHP = tonumber(newItem.hp) or 0
+            local newMana = tonumber(newItem.mana) or 0
+            
+            -- If old item had stats but new item doesn't, or stats changed significantly
+            if (oldAC > 0 or oldHP > 0 or oldMana > 0) and (newAC == 0 and newHP == 0 and newMana == 0) then
+                needsScan = true
+                reason = "stats missing from fresh data"
+            elseif (newAC == 0 and newHP == 0 and newMana == 0) and (not newItem.itemlink or newItem.itemlink == "") then
+                needsScan = true
+                reason = "missing stats and itemlink"
+            end
+        end
+        
+        if needsScan then
+            table.insert(mismatches, {
+                item = newItem,
+                slotId = slotId,
+                reason = reason,
+                botName = botName
+            })
+        end
+    end
+    
+    return mismatches
+end
+
 function BotInventory.init()
     if BotInventory.initialized then return true end
 
     mq.event("GetBotList", "Bot #1# #*# #2# is a Level #3# #4# #5# #6# owned by You.#*", BotInventory.getBotListEvent)
     mq.event("BotInventory", "Slot #1# (#2#) #*#", displayBotInventory, { keepLinks = true })
     mq.event("BotUnequip", "#1# unequips #2# from slot #3#", displayBotUnequipResponse)
+
+    -- Initialize database and pre-load prior state
+    local ok, err = db.init()
+    if not ok then
+        print(string.format("[BotInventory][DB] Initialization failed: %s", tostring(err)))
+    else
+        local loaded = db.load_all() or {}
+        for name, data in pairs(loaded) do
+            BotInventory.bot_inventories[name] = data
+            -- Seed capture set so UI can list bots immediately
+            if not BotInventory.bot_list_capture_set[name] then
+                BotInventory.bot_list_capture_set[name] = { Name = name }
+            end
+        end
+        print(string.format("[BotInventory][DB] Loaded %d bot(s) from persistence", (function(t) local c=0 for _ in pairs(t) do c=c+1 end return c end)(loaded)))
+    end
 
     print("[BotInventory] Bot inventory system initialized")
     

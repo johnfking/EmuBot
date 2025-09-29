@@ -2,6 +2,25 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local bot_inventory = require('EmuBot.modules.bot_inventory')
+local bot_management = require('EmuBot.modules.bot_management')
+local upgrade = require('EmuBot.modules.upgrade')
+local db = require('EmuBot.modules.db')
+
+-- EmuBot UI style helpers: round all relevant UI elements at radius 8
+local function EmuBot_PushRounding()
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.GrabRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.TabRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.PopupRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.ScrollbarRounding, 8)
+end
+
+local function EmuBot_PopRounding()
+    -- Pop all style vars pushed above (must remain in sync)
+    ImGui.PopStyleVar(7)
+end
 
 local function printf(fmt, ...)
     if mq.printf then
@@ -51,6 +70,11 @@ local botUI = {
     floatingPosX = 60,
     floatingPosY = 60,
     floatingButtonSize = 50,
+    -- Floating ^iu quick button
+    showUpgradeFloating = true,
+    upgradePosX = 120,
+    upgradePosY = 60,
+    upgradeButtonSize = 50,
     -- Local inventory comparison
     localInventoryCache = nil,
     localInventoryCacheTime = 0,
@@ -63,6 +87,10 @@ local botUI = {
     _maxFailures = 3, -- Max attempts before skipping a bot
     _failureTimeout = 300, -- 5 minutes before allowing retry of failed bot
     _skippedBots = {}, -- Track skipped bots with timestamp
+    -- Camp control during scan all
+    disableCampDuringScanAll = false, -- When true, don't camp bots during scan all
+    -- Auto-scan tracking
+    _autoScannedItems = 0, -- Track items auto-scanned due to mismatches
 }
 
 local function drawItemIcon(iconID, width, height)
@@ -513,12 +541,19 @@ function botUI._processScanAllBots()
         end
     end
 
+    -- Determine if we should camp based on the setting
+    local shouldCamp = not botUI.disableCampDuringScanAll
+    
     if isSpawned then
         -- Bot is already spawned, just get inventory
         printf('[EmuBot] Bot %s already spawned, requesting inventory...', currentBot)
         bot_inventory.requestBotInventory(currentBot)
-        -- Always camp after capture to respect spawn cap
-        botUI._awaitInventoryForBot(currentBot, true)
+        if shouldCamp then
+            printf('[EmuBot] Will camp %s after inventory capture', currentBot)
+        else
+            printf('[EmuBot] Camping disabled - will leave %s spawned', currentBot)
+        end
+        botUI._awaitInventoryForBot(currentBot, shouldCamp)
     else
         -- Bot needs to be spawned
         printf('[EmuBot] Spawning bot %s...', currentBot)
@@ -530,7 +565,12 @@ function botUI._processScanAllBots()
             if spawnCheck and spawnCheck.ID and spawnCheck.ID() and spawnCheck.ID() > 0 then
                 printf('[EmuBot] Bot %s spawned, requesting inventory...', currentBot)
                 bot_inventory.requestBotInventory(currentBot)
-                botUI._awaitInventoryForBot(currentBot, true) -- camp after capture
+                if shouldCamp then
+                    printf('[EmuBot] Will camp %s after inventory capture', currentBot)
+                else
+                    printf('[EmuBot] Camping disabled - will leave %s spawned', currentBot)
+                end
+                botUI._awaitInventoryForBot(currentBot, shouldCamp)
             else
                 printf('[EmuBot] Failed to spawn bot %s, skipping...', currentBot)
                 botUI._completeScanAllBotStep(currentBot, false)
@@ -573,8 +613,8 @@ function botUI._completeScanAllBotStep(botName, shouldCamp)
         if #itemsToScan > 0 then
             botUI._scanAllTotalItems = botUI._scanAllTotalItems + #itemsToScan
             printf('[EmuBot] Queueing %d items from %s for detailed scanning...', #itemsToScan, botName)
-            for _, item in ipairs(itemsToScan) do
-                botUI.enqueueItemScan(item)
+for _, item in ipairs(itemsToScan) do
+                botUI.enqueueItemScan(item, botName)
             end
         else
             printf('[EmuBot] Bot %s inventory complete, no items need scanning', botName)
@@ -583,48 +623,57 @@ function botUI._completeScanAllBotStep(botName, shouldCamp)
         printf('[EmuBot] Warning: No inventory data found for %s after scan attempt', botName)
     end
 
-    -- Always camp after inventory capture to avoid exceeding spawn caps
-    printf('[EmuBot] Camping bot %s...', botName)
-    local targeted = _targetBotByName(botName)
-    if targeted then
-        mq.cmd('/say ^botcamp')
-    else
-        printf('[EmuBot] Warning: could not target %s for camp. Skipping camp command.', botName)
-    end
+    -- Camp bot if requested, otherwise proceed immediately
+    if shouldCamp then
+        printf('[EmuBot] Camping bot %s...', botName)
+        local targeted = _targetBotByName(botName)
+        if targeted then
+            mq.cmd('/say ^botcamp')
+        else
+            printf('[EmuBot] Warning: could not target %s for camp. Skipping camp command.', botName)
+        end
 
-    -- Wait for the bot to despawn before proceeding (timeout safety)
-    local startWait = os.time()
-    local timeout = 10 -- seconds
-    local function waitDespawn()
-        local spawned = mq.TLO.Spawn(string.format('= %s', botName))
-        local stillThere = spawned and spawned.ID and spawned.ID() and spawned.ID() > 0
-        if not stillThere then
-            -- Remove this bot from the queue and proceed
-            if botUI._scanAllQueue[1] == botName then
-                table.remove(botUI._scanAllQueue, 1)
+        -- Wait for the bot to despawn before proceeding (timeout safety)
+        local startWait = os.time()
+        local timeout = 10 -- seconds
+        local function waitDespawn()
+            local spawned = mq.TLO.Spawn(string.format('= %s', botName))
+            local stillThere = spawned and spawned.ID and spawned.ID() and spawned.ID() > 0
+            if not stillThere then
+                -- Remove this bot from the queue and proceed
+                if botUI._scanAllQueue[1] == botName then
+                    table.remove(botUI._scanAllQueue, 1)
+                end
+                enqueueTask(botUI._processScanAllBots)
+                return true
             end
-            enqueueTask(botUI._processScanAllBots)
+            if os.time() - startWait >= timeout then
+                printf('[EmuBot] Timed out waiting for %s to camp. Continuing...', botName)
+                if botUI._scanAllQueue[1] == botName then
+                    table.remove(botUI._scanAllQueue, 1)
+                end
+                enqueueTask(botUI._processScanAllBots)
+                return true
+            end
+            botUI._scanAllProgress = string.format('Waiting for %s to camp...', botName)
+            enqueueTask(function()
+                mq.delay(500)
+                waitDespawn()
+            end)
             return true
         end
-        if os.time() - startWait >= timeout then
-            printf('[EmuBot] Timed out waiting for %s to camp. Continuing...', botName)
-            if botUI._scanAllQueue[1] == botName then
-                table.remove(botUI._scanAllQueue, 1)
-            end
-            enqueueTask(botUI._processScanAllBots)
-            return true
-        end
-        botUI._scanAllProgress = string.format('Waiting for %s to camp...', botName)
         enqueueTask(function()
             mq.delay(500)
             waitDespawn()
         end)
-        return true
+    else
+        printf('[EmuBot] Leaving bot %s spawned (camping disabled)', botName)
+        -- Proceed immediately without camping
+        if botUI._scanAllQueue[1] == botName then
+            table.remove(botUI._scanAllQueue, 1)
+        end
+        enqueueTask(botUI._processScanAllBots)
     end
-    enqueueTask(function()
-        mq.delay(500)
-        waitDespawn()
-    end)
 end
 
 function botUI._processBotInventoryQueue()
@@ -723,11 +772,13 @@ function botUI._processBotInventoryQueue()
 end
 
 function botUI._processNextScan()
-    local current = table.remove(botUI._scanQueue, 1)
-    if not current then
+local entry = table.remove(botUI._scanQueue, 1)
+    if not entry then
         botUI._scanActive = false
         return true
     end
+    local current = entry.item
+    local currentBot = entry.bot
     current.ac = 0
     current.hp = 0
     current.mana = 0
@@ -759,9 +810,31 @@ function botUI._processNextScan()
     local function poll()
         attempts = attempts + 1
         local statsCaptured, hasIcon, augCaptured, hasNonZero = tryRead()
-        if statsCaptured and hasIcon then
+if statsCaptured and hasIcon then
             local w = mq.TLO.Window('ItemDisplayWindow')
             if w() and w.Open() then w.DoClose() end
+
+            -- Persist updated stats for the owning bot, if known
+            if not currentBot then
+                -- Fallback: find owning bot by identity match
+                for name, inv in pairs(bot_inventory.bot_inventories or {}) do
+                    for _, it in ipairs(inv.equipped or {}) do
+                        if it == current then
+                            currentBot = name
+                            break
+                        end
+                    end
+                    if currentBot then break end
+                end
+            end
+            if currentBot then
+                local data = bot_inventory.getBotInventory and bot_inventory.getBotInventory(currentBot)
+                if data then
+                    local meta = bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[currentBot] or nil
+                    db.save_bot_inventory(currentBot, data, meta)
+                end
+            end
+
             enqueueTask(botUI._processNextScan)
             return true
         end
@@ -795,9 +868,9 @@ function botUI._processNextScan()
     return true
 end
 
-function botUI.enqueueItemScan(item)
+function botUI.enqueueItemScan(item, botName)
     if not item or not item.itemlink then return end
-    table.insert(botUI._scanQueue, item)
+    table.insert(botUI._scanQueue, { item = item, bot = botName })
     if botUI._scanActive then return end
     botUI._scanActive = true
     enqueueTask(botUI._processNextScan)
@@ -1318,6 +1391,7 @@ function botUI.drawLocalComparisonWindow()
     
     local windowFlags = ImGuiWindowFlags.None
     
+EmuBot_PushRounding()
     ImGui.SetNextWindowSize(ImVec2(800, 600), ImGuiCond.FirstUseEver)
     local isOpen, shouldShow = ImGui.Begin('Local Items Comparison##LocalCompare', true, windowFlags)
     
@@ -1325,6 +1399,7 @@ function botUI.drawLocalComparisonWindow()
         botUI.showLocalCompareWindow = false
         botUI.rightClickedBotItem = nil
         ImGui.End()
+        EmuBot_PopRounding()
         return
     end
     
@@ -1521,6 +1596,7 @@ function botUI.drawLocalComparisonWindow()
     end -- shouldShow
     
     ImGui.End()
+    EmuBot_PopRounding()
 end
 
 local function drawAugmentTab(equippedItems)
@@ -1706,7 +1782,7 @@ local function drawVisualTab(equippedItems)
                 botUI.selectedBotSlotName = nil
                 slotResults = {}
             end
-            ImGui.SameLine()
+ImGui.SameLine()
             if ImGui.SmallButton('Scan Items##BotSlotScan') then
                 local seen = {}
                 local pending = {}
@@ -1717,13 +1793,13 @@ local function drawVisualTab(equippedItems)
                         local key = tostring(item)
                         if not seen[key] then
                             seen[key] = true
-                            table.insert(allItems, item)
+                            table.insert(allItems, { item = item, bot = entry.bot })
                             local missing = (not item.ac and not item.hp and not item.mana)
                                 or ((tonumber(item.ac or 0) == 0)
                                     and (tonumber(item.hp or 0) == 0)
                                     and (tonumber(item.mana or 0) == 0))
                             if missing then
-                                table.insert(pending, item)
+                                table.insert(pending, { item = item, bot = entry.bot })
                             end
                         end
                     end
@@ -1732,8 +1808,8 @@ local function drawVisualTab(equippedItems)
                 if #toScan == 0 then
                     toScan = allItems
                 end
-                for _, item in ipairs(toScan) do
-                    botUI.enqueueItemScan(item)
+                for _, pair in ipairs(toScan) do
+                    botUI.enqueueItemScan(pair.item, pair.bot)
                 end
                 printf('Queued scan for %d slot item(s) in %s', #toScan, slotName or tostring(botUI.selectedBotSlotID))
             end
@@ -1885,8 +1961,8 @@ local function drawTableTab(equippedItems)
             ImGui.TableNextColumn()
             if (not item.ac or not item.hp or not item.mana)
                 or ((item.ac == 0) and (item.hp == 0) and (item.mana == 0)) then
-                if ImGui.Button('Scan##' .. tostring(item.slotid or 'unknown')) then
-                    botUI.enqueueItemScan(item)
+if ImGui.Button('Scan##' .. tostring(item.slotid or 'unknown')) then
+                    botUI.enqueueItemScan(item, botUI.selectedBot and botUI.selectedBot.name or nil)
                 end
                 if ImGui.IsItemHovered() then
                     ImGui.SetTooltip('Open ItemDisplay to scrape stats')
@@ -1968,6 +2044,7 @@ function botUI.drawBotInventoryWindow()
         equippedItems = botUI.selectedBot.data.equipped
     end
 
+EmuBot_PushRounding()
     ImGui.SetNextWindowSize(ImVec2(600, 400), ImGuiCond.FirstUseEver)
     local isOpen, shouldShow = ImGui.Begin('Bot Inventory Viewer##EmuBot', true, ImGuiWindowFlags.None)
     if not isOpen then
@@ -1976,6 +2053,7 @@ function botUI.drawBotInventoryWindow()
         botUI.selectedBotSlotID = nil
         botUI.selectedBotSlotName = nil
         ImGui.End()
+        EmuBot_PopRounding()
         return
     end
 
@@ -2005,60 +2083,43 @@ function botUI.drawBotInventoryWindow()
         ImGui.SetNextItemWidth(math.max(150, math.min(windowWidth * 0.35, 250)))
         if #botList > 0 then
             
-            -- Find current bot index for combo
-            local currentBotIndex = -1  -- Start with -1 (no selection)
-            for i, botName in ipairs(botList) do
-                if botName == currentBotName then
-                    currentBotIndex = i  -- ImGui.Combo uses 0-based indexing
+            -- Find current bot index for combo (MQ Lua binding appears 1-based)
+            local currentIndex1 = 0  -- 0 = no selection
+            for i, name in ipairs(botList) do
+                if name == currentBotName then
+                    currentIndex1 = i
                     break
                 end
             end
-                        
-            -- Use simple ImGui.Combo with standard 0-based indexing
-            local selectedIndex, changed = ImGui.Combo('##BotInventorySelect', currentBotIndex, botList)
+
+            -- Use ImGui.Combo and treat index as 1-based
+            local selectedIndex1, changed = ImGui.Combo('##BotInventorySelect', currentIndex1, botList)
             
             -- Process selection when changed
-            if changed and selectedIndex >= 0 and selectedIndex < #botList then
-                -- Test different index interpretations
-                local directIndex = selectedIndex  -- Standard 0-based to 1-based conversion
-                local correctedIndex = selectedIndex    -- Use selectedIndex directly as 1-based
-                
-                -- Use direct conversion for now, but log both for comparison
-                local luaIndex = directIndex
+            if changed and selectedIndex1 ~= nil and selectedIndex1 >= 1 and selectedIndex1 <= #botList then
+                local luaIndex = selectedIndex1 -- 1-based
                 local botName = botList[luaIndex]
-                
-                -- Validate the bot name exists in the list
-                if not botName or botName == '' then
-                    -- Try the alternative indexing as fallback
-                    luaIndex = correctedIndex
-                    botName = botList[luaIndex]
-                    if not botName or botName == '' then
-                        return
-                    else
-                        printf('[EmuBot] Fallback indexing worked: %d -> "%s"', luaIndex, botName)
+                if botName and botName ~= '' then
+                    -- Always process the selection (even if same bot) to allow refresh
+                    local botData = bot_inventory and bot_inventory.getBotInventory and bot_inventory.getBotInventory(botName)
+                    if (not botData or not botData.equipped) then
+                        botUI._enqueueBotInventoryFetch(botName)
                     end
+                    botUI.selectedBot = { name = botName }
+                    if botData then
+                        botUI.selectedBot.data = botData
+                    else
+                        syncSelectedBotData()
+                        botData = botUI.selectedBot and botUI.selectedBot.data or nil
+                    end
+                    botUI.selectedBotSlotID = nil
+                    botUI.selectedBotSlotName = nil
+                    equippedItems = (botData and botData.equipped) or {}
+                    currentBotName = botName
+                    comboLabel = botName
                 end
-                                
-                -- Always process the selection, even if it's the same bot (for refresh purposes)
-                local botData = bot_inventory and bot_inventory.getBotInventory and bot_inventory.getBotInventory(botName)
-                
-                if (not botData or not botData.equipped) then
-                    botUI._enqueueBotInventoryFetch(botName)
-                end
-                botUI.selectedBot = { name = botName }
-                if botData then
-                    botUI.selectedBot.data = botData
-                else
-                    syncSelectedBotData()
-                    botData = botUI.selectedBot and botUI.selectedBot.data or nil
-                end
-                botUI.selectedBotSlotID = nil
-                botUI.selectedBotSlotName = nil
-                equippedItems = (botData and botData.equipped) or {}
-                currentBotName = botName
-                comboLabel = botName
             elseif changed then
-                printf('[EmuBot] Warning: Invalid bot selection index %d (list size: %d)', selectedIndex, #botList)
+                printf('[EmuBot] Warning: Invalid bot selection index %s (list size: %d)', tostring(selectedIndex1), #botList)
             end
         else
             ImGui.Text(comboLabel)
@@ -2078,12 +2139,15 @@ function botUI.drawBotInventoryWindow()
                 printf('Refreshing inventory for bot: %s', botUI.selectedBot.name)
             end
         end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Refresh inventory data from bot\nAutomatically detects and scans items with mismatched or missing stats')
+        end
 
         ImGui.SameLine()
 
         if ImGui.Button('Scan Selected Bot', buttonWidth, 0) then
             local itemsToScan = {}
-            for _, it in ipairs(equippedItems or {}) do
+for _, it in ipairs(equippedItems or {}) do
                 local missing = (not it.ac and not it.hp and not it.mana)
                     or ((it.ac or 0) == 0 and (it.hp or 0) == 0 and (it.mana or 0) == 0)
                 if missing then
@@ -2092,19 +2156,20 @@ function botUI.drawBotInventoryWindow()
             end
             if #itemsToScan == 0 then itemsToScan = equippedItems or {} end
             for _, it in ipairs(itemsToScan) do
-                botUI.enqueueItemScan(it)
+                botUI.enqueueItemScan(it, botUI.selectedBot and botUI.selectedBot.name or nil)
             end
             printf('Queued scan for %d item(s)', #itemsToScan)
         end
 
         ImGui.SameLine()
 
-        if ImGui.Button('Close Window', buttonWidth, 0) then
+if ImGui.Button('Close Window', buttonWidth, 0) then
             botUI.showWindow = false
             botUI.selectedBot = nil
             botUI.selectedBotSlotID = nil
             botUI.selectedBotSlotName = nil
             ImGui.End()
+            EmuBot_PopRounding()
             return
         end
         
@@ -2157,7 +2222,13 @@ function botUI.drawBotInventoryWindow()
                 botUI.startScanAllBots()
             end
             if ImGui.IsItemHovered() then
-                ImGui.SetTooltip('Spawn all bots, gather their inventory data, then camp them')
+                local tooltipText = 'Spawn all bots and gather their inventory data'
+                if botUI.disableCampDuringScanAll then
+                    tooltipText = tooltipText .. ' (camping disabled - bots will remain spawned)'
+                else
+                    tooltipText = tooltipText .. ', then camp them'
+                end
+                ImGui.SetTooltip(tooltipText)
             end
         else
             if ImGui.Button('Cancel Scan', buttonWidth, 0) then
@@ -2166,6 +2237,42 @@ function botUI.drawBotInventoryWindow()
             if ImGui.IsItemHovered() then
                 ImGui.SetTooltip('Stop the current scan all bots operation')
             end
+        end
+        
+        -- Toggle switch for disable camp setting
+        ImGui.SameLine()
+        ImGui.Text('No Camp:')
+        ImGui.SameLine()
+        
+        -- Create a styled toggle switch
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 12.0)
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, ImVec2(8, 4))
+        
+        if botUI.disableCampDuringScanAll then
+            -- ON state - green background with white text
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.7, 0.2, 0.8)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.3, 0.8, 0.3, 0.9)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.1, 0.6, 0.1, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.Text, 1.0, 1.0, 1.0, 1.0)
+            if ImGui.Button(' ON ') then
+                botUI.disableCampDuringScanAll = false
+            end
+        else
+            -- OFF state - red background with white text
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.7, 0.2, 0.2, 0.8)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 0.9)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.6, 0.1, 0.1, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.Text, 1.0, 1.0, 1.0, 1.0)
+            if ImGui.Button('OFF') then
+                botUI.disableCampDuringScanAll = true
+            end
+        end
+        
+        ImGui.PopStyleColor(4)
+        ImGui.PopStyleVar(2)
+        
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Toggle: Disable camping bots after scan (useful when scanning fewer than spawn limit)')
         end
         
         -- Show progress if scan is active
@@ -2177,7 +2284,14 @@ function botUI.drawBotInventoryWindow()
         -- Show item scanning queue status
         if #botUI._scanQueue > 0 then
             ImGui.SameLine()
-            ImGui.TextColored(0.3, 0.6, 1.0, 1.0, string.format('(%d items scanning)', #botUI._scanQueue))
+            local statusText = string.format('(%d items scanning)', #botUI._scanQueue)
+            if botUI._autoScannedItems > 0 then
+                statusText = statusText .. string.format(' [%d auto-scanned]', botUI._autoScannedItems)
+            end
+            ImGui.TextColored(0.3, 0.6, 1.0, 1.0, statusText)
+        elseif botUI._autoScannedItems > 0 then
+            ImGui.SameLine()
+            ImGui.TextColored(0.2, 0.8, 0.2, 1.0, string.format('(%d items auto-scanned)', botUI._autoScannedItems))
         end
 
         if botUI.lastExportMessage then
@@ -2191,7 +2305,7 @@ function botUI.drawBotInventoryWindow()
 
         ImGui.Separator()
 
-        if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
+if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
             if ImGui.BeginTabItem('Visual') then
                 drawVisualTab(equippedItems)
                 ImGui.EndTabItem()
@@ -2204,6 +2318,16 @@ function botUI.drawBotInventoryWindow()
 
             if ImGui.BeginTabItem('Augments') then
                 drawAugmentTab(equippedItems)
+                ImGui.EndTabItem()
+            end
+
+            if ImGui.BeginTabItem('Bot Management') then
+                bot_management.draw()
+                ImGui.EndTabItem()
+            end
+
+            if ImGui.BeginTabItem('Upgrades') then
+                upgrade.draw_tab()
                 ImGui.EndTabItem()
             end
 
@@ -2362,6 +2486,7 @@ function botUI.drawBotInventoryWindow()
     end
 
     ImGui.End()
+    EmuBot_PopRounding()
 end
 
 local function drawFloatingToggle()
@@ -2427,9 +2552,79 @@ local function drawFloatingToggle()
     ImGui.PopStyleVar(3)
 end
 
+local function drawUpgradeQuickButton()
+    if not botUI.showUpgradeFloating then return end
+
+    -- Position and minimal floating window for ^iu
+    ImGui.SetNextWindowPos(ImVec2(botUI.upgradePosX, botUI.upgradePosY), ImGuiCond.FirstUseEver)
+    ImGui.SetNextWindowSize(ImVec2(botUI.upgradeButtonSize + 8, botUI.upgradeButtonSize + 8), ImGuiCond.FirstUseEver)
+
+    local flags = bit32.bor(
+        ImGuiWindowFlags.NoTitleBar,
+        ImGuiWindowFlags.NoResize,
+        ImGuiWindowFlags.NoScrollbar,
+        ImGuiWindowFlags.NoScrollWithMouse,
+        ImGuiWindowFlags.NoCollapse,
+        ImGuiWindowFlags.AlwaysAutoResize,
+        ImGuiWindowFlags.NoBackground,
+        ImGuiWindowFlags.NoDecoration
+    )
+
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, 4, 4)
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 1)
+    ImGui.PushStyleColor(ImGuiCol.WindowBg, 0.1, 0.1, 0.1, 0.85)
+    ImGui.PushStyleColor(ImGuiCol.Border, 0.4, 0.4, 0.4, 0.8)
+
+    if ImGui.Begin('EmuBotIU', true, flags) then
+        -- Track position as it moves
+        local pos = ImGui.GetWindowPosVec()
+        if pos then
+            botUI.upgradePosX = pos.x
+            botUI.upgradePosY = pos.y
+        end
+
+        -- Use color indicating cursor status
+        if mq.TLO.Cursor() then
+            -- Cursor has item: accent blue
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.5, 0.9, 0.9)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.3, 0.6, 1.0, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.15, 0.45, 0.85, 1.0)
+        else
+            -- No item: gray
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.4, 0.4, 0.4, 0.9)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.5, 0.5, 0.5, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.35, 0.35, 0.35, 1.0)
+        end
+
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, math.min(12, botUI.upgradeButtonSize * 0.4))
+
+        if ImGui.Button('IU', ImVec2(botUI.upgradeButtonSize, botUI.upgradeButtonSize)) then
+            if upgrade and upgrade.poll_iu then
+                upgrade.poll_iu()
+            else
+                mq.cmd('/say ^iu')
+            end
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Poll bots for upgrades (^iu)')
+        end
+
+        ImGui.PopStyleVar(1)
+        ImGui.PopStyleColor(3)
+    end
+    ImGui.End()
+    ImGui.PopStyleColor(2)
+    ImGui.PopStyleVar(3)
+end
+
 function botUI.render()
-    -- Draw floating toggle even if main window is closed
+    -- Draw floating toggles even if main window is closed
     drawFloatingToggle()
+    drawUpgradeQuickButton()
+    -- Draw upgrade comparison overlay window even if tab is not active
+    if upgrade and upgrade.draw_compare_window then upgrade.draw_compare_window() end
+    
     botUI.drawBotInventoryWindow()
     
     -- Draw the local comparison window if needed (separate window)
@@ -2521,6 +2716,11 @@ mq.bind("/emubotbutton", function(...)
     printf('[EmuBot] Floating toggle %s', botUI.showFloatingToggle and 'enabled' or 'disabled')
 end)
 
+mq.bind("/emubotiu", function(...)
+    botUI.showUpgradeFloating = not botUI.showUpgradeFloating
+    printf('[EmuBot] ^iu quick button %s', botUI.showUpgradeFloating and 'enabled' or 'disabled')
+end)
+
 local function main()
     if not bot_inventory.init() then
         print('[EmuBot] Failed to initialize bot inventory system')
@@ -2551,9 +2751,21 @@ local function main()
             botUI._botInventoryFetchSet[botName] = nil
         end
     end
+    
+    -- Connect mismatch detection to item scanning system
+    bot_inventory.onMismatchDetected = function(item, botName, reason)
+        if botUI.enqueueItemScan then
+            botUI.enqueueItemScan(item, botName)
+            botUI._autoScannedItems = botUI._autoScannedItems + 1
+            printf('[EmuBot] Auto-scanning %s from %s due to: %s', item.name or 'unknown item', botName, reason)
+        end
+    end
 
     -- Kick off a bot list refresh on startup so the dropdown populates.
     refreshBotList()
+
+    -- Initialize optional modules
+    if upgrade and upgrade.init then upgrade.init() end
 
     mq.imgui.init('EmuBot', function()
         botUI.render()
