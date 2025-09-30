@@ -4,6 +4,7 @@ local ImGui = require('ImGui')
 local bot_inventory = require('EmuBot.modules.bot_inventory')
 local bot_management = require('EmuBot.modules.bot_management')
 local bot_groups = require('EmuBot.modules.bot_groups')
+local raid_manager = require('EmuBot.modules.raid_manager')
 local upgrade = require('EmuBot.modules.upgrade')
 local db = require('EmuBot.modules.db')
 
@@ -2687,6 +2688,11 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                 ImGui.EndTabItem()
             end
 
+            if ImGui.BeginTabItem('Raid Manager') then
+                raid_manager.draw_tab()
+                ImGui.EndTabItem()
+            end
+
             if ImGui.BeginTabItem('Upgrades') then
                 upgrade.draw_tab()
                 ImGui.EndTabItem()
@@ -3128,6 +3134,8 @@ local function main()
 
     -- Initialize optional modules
     if bot_groups and bot_groups.init then bot_groups.init() end
+    if raid_manager and raid_manager.set_enqueue then raid_manager.set_enqueue(enqueueTask) end
+    if raid_manager and raid_manager.init then raid_manager.init() end
     if upgrade and upgrade.init then upgrade.init() end
 
     mq.imgui.init('EmuBot', function()
