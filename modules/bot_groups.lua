@@ -15,6 +15,10 @@ M.newGroupName = ""
 M.newGroupDescription = ""
 M.groupOperationInProgress = false
 M.operationStatus = ""
+-- internal tick-based throttle for fast, safe invites
+M._tick = 0
+M._lastInviteTick = 0
+M._inviteTickInterval = 3 -- ~150ms when main loop runs every 50ms
 
 local function printf(fmt, ...)
     if mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end
@@ -190,13 +194,10 @@ function M.invite_group(groupId)
     for _, member in ipairs(group.members) do
         local botName = member.bot_name
         if is_bot_spawned(botName) then
-            if target_bot(botName) then
-                mq.cmd('/invite')
-                printf('[EmuBot] Inviting %s to group', botName)
-                mq.delay(500) -- Small delay between invites (safe now via enqueueTask)
-            else
-                printf('[EmuBot] Failed to target %s for invite', botName)
-            end
+            -- Invite directly by name to avoid target hops
+            mq.cmdf('/invite %s', botName)
+            printf('[EmuBot] Inviting %s to group', botName)
+            mq.delay(100)
         else
             printf('[EmuBot] %s not spawned, cannot invite', botName)
         end
@@ -244,15 +245,14 @@ function M.spawn_and_invite_group(groupId)
         end
     end
     
-    -- Start the invitation process after a delay
-    local inviteStartTime = os.time() + 3 -- Wait 3 seconds for spawns
+    -- Prepare invitation state; invitations will begin immediately and
+    -- proceed as soon as each bot appears in the spawn list.
     M._inviteGroup = {
         groupId = groupId,
         groupName = group.name,
         botsToInvite = {},
         currentBotIndex = 1,
-        inviteStartTime = inviteStartTime,
-        lastInviteTime = 0
+        attempts = {},
     }
     
     -- Add already spawned bots to invite list immediately
@@ -271,43 +271,44 @@ end
 -- Process pending invitations (called from main loop)
 function M.process_invitations()
     if not M._inviteGroup then return end
-    
-    local now = os.time()
+
+    -- tick forward; main loop calls every ~50ms
+    M._tick = (M._tick or 0) + 1
+
     local invite = M._inviteGroup
-    
-    -- Wait for spawn delay to pass
-    if now < invite.inviteStartTime then return end
-    
-    -- Check if we have bots to invite
+
+    -- Finished?
     if invite.currentBotIndex > #invite.botsToInvite then
-        -- Finished inviting
         M.groupOperationInProgress = false
         M.operationStatus = string.format('Completed spawning and inviting group "%s"', invite.groupName)
         M._inviteGroup = nil
-        
-        -- Note: Removed mq.delay(2000) to prevent non-yieldable thread error
-        -- Status will clear on next UI update cycle
         M.operationStatus = ""
         return
     end
-    
-    -- Throttle invites (one per second)
-    if now - invite.lastInviteTime < 1 then return end
-    
+
+    -- Throttle: ensure minimal spacing between invites
+    if (M._tick - (M._lastInviteTick or 0)) < (M._inviteTickInterval or 3) then
+        return
+    end
+
     local botName = invite.botsToInvite[invite.currentBotIndex]
     if is_bot_spawned(botName) then
-        if target_bot(botName) then
-            mq.cmd('/invite')
-            printf('[EmuBot] Inviting %s to group', botName)
-            invite.lastInviteTime = now
-        else
-            printf('[EmuBot] Failed to target %s for invite', botName)
-        end
+        -- Direct invite by name for speed and reliability
+        mq.cmdf('/invite %s', botName)
+        printf('[EmuBot] Inviting %s to group', botName)
+        M._lastInviteTick = M._tick
+        invite.currentBotIndex = invite.currentBotIndex + 1
     else
-        printf('[EmuBot] %s failed to spawn, cannot invite', botName)
+        -- Not spawned yet; wait and re-check next tick without advancing index
+        -- Optionally track attempts to avoid infinite waiting (e.g., after ~10s)
+        local a = (invite.attempts[botName] or 0) + 1
+        invite.attempts[botName] = a
+        -- After ~200 attempts (~10s at 50ms/tick), skip and move on
+        if a >= 200 then
+            printf('[EmuBot] %s did not appear in time, skipping invite', botName)
+            invite.currentBotIndex = invite.currentBotIndex + 1
+        end
     end
-    
-    invite.currentBotIndex = invite.currentBotIndex + 1
 end
 
 -- Get group status (how many spawned, etc.)
