@@ -193,7 +193,7 @@ function M.invite_group(groupId)
             if target_bot(botName) then
                 mq.cmd('/invite')
                 printf('[EmuBot] Inviting %s to group', botName)
-                mq.delay(500) -- Small delay between invites
+                mq.delay(500) -- Small delay between invites (safe now via enqueueTask)
             else
                 printf('[EmuBot] Failed to target %s for invite', botName)
             end
@@ -285,8 +285,8 @@ function M.process_invitations()
         M.operationStatus = string.format('Completed spawning and inviting group "%s"', invite.groupName)
         M._inviteGroup = nil
         
-        -- Clear status after showing for a bit
-        mq.delay(2000)
+        -- Note: Removed mq.delay(2000) to prevent non-yieldable thread error
+        -- Status will clear on next UI update cycle
         M.operationStatus = ""
         return
     end

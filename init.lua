@@ -2175,7 +2175,10 @@ function drawBotGroupsTab()
                 end
                 ImGui.SameLine()
                 if ImGui.SmallButton('Invite') then
-                    bot_groups.invite_group(group.id)
+                    -- Use enqueueTask to avoid non-yieldable thread error from mq.delay()
+                    enqueueTask(function()
+                        bot_groups.invite_group(group.id)
+                    end)
                 end
                 ImGui.SameLine()
                 if ImGui.SmallButton('Spawn & Invite') then

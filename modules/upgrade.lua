@@ -337,7 +337,8 @@ function U.init()
     -- Examples from screenshot:
     -- Cadwen says, 'I can use that for my Finger 1! Would you like to give it to me?'
     -- Dragkan says, 'I can use that for my Finger 1 instead of my Elegant Adept's Ring! Would you like to remove my item?'
-    mq.event('EmuBot_IU_Give', "#1# says, 'I can use that for my #2#! #*", on_iu_basic)
+    -- Fixed: Made patterns mutually exclusive to prevent duplicate slot capture
+    mq.event('EmuBot_IU_Give', "#1# says, 'I can use that for my #2#! Would you like to give it to me?'", on_iu_basic)
     mq.event('EmuBot_IU_Replace', "#1# says, 'I can use that for my #2# instead of my #3#! #*", on_iu_instead)
     U._events_inited = true
 end
