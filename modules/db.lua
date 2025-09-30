@@ -132,6 +132,25 @@ local function exec_ddl()
     CREATE INDEX IF NOT EXISTS idx_items_bot ON items(bot_name);
     CREATE INDEX IF NOT EXISTS idx_items_bot_loc ON items(bot_name, location);
     CREATE INDEX IF NOT EXISTS idx_items_slot ON items(slotid);
+
+    CREATE TABLE IF NOT EXISTS bot_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT,
+        created_at INTEGER DEFAULT (strftime('%s','now')),
+        updated_at INTEGER DEFAULT (strftime('%s','now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS bot_group_members (
+        group_id INTEGER NOT NULL,
+        bot_name TEXT NOT NULL,
+        added_at INTEGER DEFAULT (strftime('%s','now')),
+        PRIMARY KEY (group_id, bot_name),
+        FOREIGN KEY (group_id) REFERENCES bot_groups(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_group_members_group ON bot_group_members(group_id);
+    CREATE INDEX IF NOT EXISTS idx_group_members_bot ON bot_group_members(bot_name);
     ]]
     return M._db:exec(ddl) == sqlite3.OK
 end
@@ -284,6 +303,119 @@ function M.load_all()
         end
     end
     return result
+end
+
+-- Bot Group Management Functions
+
+function M.create_group(name, description)
+    if not M._db then return false, 'db not initialized' end
+    if not name or name == '' then return false, 'group name required' end
+    
+    local stmt = M._db:prepare('INSERT INTO bot_groups (name, description) VALUES (?, ?)')
+    if not stmt then return false, 'prepare failed' end
+    
+    stmt:bind_values(name, description or '')
+    local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    local groupId = nil
+    
+    if ok then
+        groupId = M._db:last_insert_rowid()
+    end
+    
+    local err = not ok and last_error() or nil
+    stmt:finalize()
+    
+    if ok then
+        return true, groupId
+    else
+        return false, err
+    end
+end
+
+function M.delete_group(groupId)
+    if not M._db then return false, 'db not initialized' end
+    if not groupId then return false, 'group id required' end
+    
+    local stmt = M._db:prepare('DELETE FROM bot_groups WHERE id = ?')
+    if not stmt then return false, 'prepare failed' end
+    
+    stmt:bind_values(groupId)
+    local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    
+    stmt:finalize()
+    return ok, not ok and last_error() or nil
+end
+
+function M.update_group(groupId, name, description)
+    if not M._db then return false, 'db not initialized' end
+    if not groupId or not name then return false, 'group id and name required' end
+    
+    local stmt = M._db:prepare('UPDATE bot_groups SET name = ?, description = ?, updated_at = strftime(\'%s\',\'now\') WHERE id = ?')
+    if not stmt then return false, 'prepare failed' end
+    
+    stmt:bind_values(name, description or '', groupId)
+    local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    
+    stmt:finalize()
+    return ok, not ok and last_error() or nil
+end
+
+function M.get_all_groups()
+    if not M._db then return {} end
+    return collect_rows('SELECT id, name, description, created_at, updated_at FROM bot_groups ORDER BY name', nil)
+end
+
+function M.add_bot_to_group(groupId, botName)
+    if not M._db then return false, 'db not initialized' end
+    if not groupId or not botName then return false, 'group id and bot name required' end
+    
+    local stmt = M._db:prepare('INSERT OR IGNORE INTO bot_group_members (group_id, bot_name) VALUES (?, ?)')
+    if not stmt then return false, 'prepare failed' end
+    
+    stmt:bind_values(groupId, botName)
+    local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    
+    stmt:finalize()
+    return ok, not ok and last_error() or nil
+end
+
+function M.remove_bot_from_group(groupId, botName)
+    if not M._db then return false, 'db not initialized' end
+    if not groupId or not botName then return false, 'group id and bot name required' end
+    
+    local stmt = M._db:prepare('DELETE FROM bot_group_members WHERE group_id = ? AND bot_name = ?')
+    if not stmt then return false, 'prepare failed' end
+    
+    stmt:bind_values(groupId, botName)
+    local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    
+    stmt:finalize()
+    return ok, not ok and last_error() or nil
+end
+
+function M.get_group_members(groupId)
+    if not M._db then return {} end
+    if not groupId then return {} end
+    
+    return collect_rows('SELECT bot_name, added_at FROM bot_group_members WHERE group_id = ? ORDER BY bot_name', function(s)
+        s:bind_values(groupId)
+    end)
+end
+
+function M.get_groups_with_members()
+    if not M._db then return {} end
+    
+    local groups = M.get_all_groups()
+    for _, group in ipairs(groups) do
+        group.members = M.get_group_members(group.id)
+    end
+    
+    return groups
 end
 
 return M

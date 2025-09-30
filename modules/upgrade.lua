@@ -1,5 +1,5 @@
 -- emubot/modules/upgrade.lua
--- EmuBot Upgrades: determine which bots can use the cursor item and allow swapping (give) like Puppeteer
+-- EmuBot Upgrades: determine which bots can use the cursor item and allow swapping
 
 local mq = require('mq')
 local bot_inventory = require('EmuBot.modules.bot_inventory')
@@ -44,6 +44,36 @@ local function normalize_class(name)
     if not name then return nil end
     local up = tostring(name):upper()
     return classMap[up] or up
+end
+
+local function extract_class_abbreviation(classString)
+    if not classString then return 'UNK' end
+    local str = tostring(classString):upper()
+    
+    -- Check if it's already a 3-letter abbreviation we recognize
+    for abbrev, _ in pairs(classMap) do
+        if str == abbrev then return abbrev end
+    end
+    
+    -- Extract class from "Race Class" format by looking for class keywords
+    local classKeywords = {
+        'WARRIOR', 'CLERIC', 'PALADIN', 'RANGER', 'SHADOW KNIGHT', 'SHADOWKNIGHT',
+        'DRUID', 'MONK', 'BARD', 'ROGUE', 'SHAMAN', 'NECROMANCER', 'WIZARD',
+        'MAGICIAN', 'ENCHANTER', 'BEASTLORD', 'BERSERKER'
+    }
+    
+    for _, class in ipairs(classKeywords) do
+        if str:find(class) then
+            -- Find the abbreviation for this class
+            for abbrev, fullName in pairs(classMap) do
+                if fullName == class then
+                    return abbrev
+                end
+            end
+        end
+    end
+    
+    return 'UNK'
 end
 
 local function can_item_be_used_by_class(itemTLO, className)
@@ -102,7 +132,8 @@ local function compute_local_candidates_from_cursor()
         if classOK then
             for _, sid in ipairs(slotIDs) do
                 local slotName = slotNames[sid] or ('Slot ' .. tostring(sid))
-                add_candidate({ bot = botName, slotid = sid, slotname = slotName, itemID = itemID, itemName = itemName })
+                local classAbbrev = extract_class_abbreviation(botClass)
+                add_candidate({ bot = botName, class = classAbbrev, slotid = sid, slotname = slotName, itemID = itemID, itemName = itemName })
             end
         end
     end
@@ -199,8 +230,9 @@ function U.draw_tab()
         return
     end
 
-    if ImGui.BeginTable('EmuBotUpgradeTable', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
-        ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 160)
+    if ImGui.BeginTable('EmuBotUpgradeTable', 5, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+        ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
+        ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
         ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 120)
@@ -211,7 +243,26 @@ function U.draw_tab()
             ImGui.PushID('upg_' .. tostring(i))
 
             ImGui.TableNextColumn()
-            ImGui.Text(row.bot or 'Unknown')
+            if ImGui.Selectable((row.bot or 'Unknown') .. '##maintarget_' .. tostring(i), false, ImGuiSelectableFlags.None) then
+                -- Target the bot when clicked
+                local botName = row.bot
+                if botName then
+                    local s = mq.TLO.Spawn(string.format('= %s', botName))
+                    if s and s.ID and s.ID() and s.ID() > 0 then
+                        mq.cmdf('/target id %d', s.ID())
+                        printf('[EmuBot] Targeting %s', botName)
+                    else
+                        mq.cmdf('/target "%s"', botName)
+                        printf('[EmuBot] Attempting to target %s', botName)
+                    end
+                end
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Click to target ' .. (row.bot or 'bot'))
+            end
+
+            ImGui.TableNextColumn()
+            ImGui.Text(row.class or 'UNK')
 
             ImGui.TableNextColumn()
             ImGui.Text(row.slotname or ('Slot ' .. tostring(row.slotid or '?')))
@@ -264,7 +315,15 @@ local function on_iu_basic(line, name, slotPhrase)
     local itemName = mq.TLO.Cursor.Name() or 'Item'
     local sid, sname = slot_from_phrase(slotPhrase)
     if not sid then return end
-    add_candidate({ bot = name, slotid = sid, slotname = sname, itemID = itemID, itemName = itemName })
+    
+    -- Get bot class from metadata if available
+    local botClass = 'UNK'
+    if bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[name] then
+        botClass = bot_inventory.bot_list_capture_set[name].Class or 'UNK'
+    end
+    local classAbbrev = extract_class_abbreviation(botClass)
+    
+    add_candidate({ bot = name, class = classAbbrev, slotid = sid, slotname = sname, itemID = itemID, itemName = itemName })
     U._show_compare = true
 end
 
@@ -312,8 +371,9 @@ function U.draw_compare_window()
         return
     end
 
-    if ImGui.BeginTable('EmuBotUpgradeCompare', 8, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
-        ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 160)
+    if ImGui.BeginTable('EmuBotUpgradeCompare', 9, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+        ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
+        ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableSetupColumn('Current', ImGuiTableColumnFlags.WidthStretch)
         ImGui.TableSetupColumn('Upgrade', ImGuiTableColumnFlags.WidthStretch)
@@ -340,7 +400,25 @@ function U.draw_compare_window()
             local dHP = (upgHP or 0) - cHP
             local dMana = (upgMana or 0) - cMana
 
-            ImGui.TableNextColumn(); ImGui.Text(row.bot or 'Unknown')
+            ImGui.TableNextColumn()
+            if ImGui.Selectable((row.bot or 'Unknown') .. '##target_' .. tostring(i), false, ImGuiSelectableFlags.None) then
+                -- Target the bot when clicked
+                local botName = row.bot
+                if botName then
+                    local s = mq.TLO.Spawn(string.format('= %s', botName))
+                    if s and s.ID and s.ID() and s.ID() > 0 then
+                        mq.cmdf('/target id %d', s.ID())
+                        printf('[EmuBot] Targeting %s', botName)
+                    else
+                        mq.cmdf('/target "%s"', botName)
+                        printf('[EmuBot] Attempting to target %s', botName)
+                    end
+                end
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Click to target ' .. (row.bot or 'bot'))
+            end
+            ImGui.TableNextColumn(); ImGui.Text(row.class or 'UNK')
             ImGui.TableNextColumn(); ImGui.Text(row.slotname or ('Slot ' .. tostring(row.slotid or '?')))
 
             -- Current (name only)

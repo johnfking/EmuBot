@@ -3,6 +3,7 @@ local ImGui = require('ImGui')
 
 local bot_inventory = require('EmuBot.modules.bot_inventory')
 local bot_management = require('EmuBot.modules.bot_management')
+local bot_groups = require('EmuBot.modules.bot_groups')
 local upgrade = require('EmuBot.modules.upgrade')
 local db = require('EmuBot.modules.db')
 
@@ -1829,7 +1830,23 @@ ImGui.SameLine()
                     for _, entry in ipairs(slotResults) do
                         ImGui.TableNextRow()
                         ImGui.TableNextColumn()
-                        ImGui.Text(entry.bot or 'Unknown')
+                        local botLabel = (entry.bot or 'Unknown') .. '##vis_target_' .. tostring(entry.bot or '?')
+                        if ImGui.Selectable(botLabel, false, ImGuiSelectableFlags.None) then
+                            local botName = entry.bot
+                            if botName then
+                                local s = mq.TLO.Spawn(string.format('= %s', botName))
+                                if s and s.ID and s.ID() and s.ID() > 0 then
+                                    mq.cmdf('/target id %d', s.ID())
+                                    printf('[EmuBot] Targeting %s', botName)
+                                else
+                                    mq.cmdf('/target "%s"', botName)
+                                    printf('[EmuBot] Attempting to target %s', botName)
+                                end
+                            end
+                        end
+                        if ImGui.IsItemHovered() then
+                            ImGui.SetTooltip('Click to target ' .. (entry.bot or 'bot'))
+                        end
 
                         ImGui.TableNextColumn()
                         if entry.item then
@@ -2033,6 +2050,294 @@ if ImGui.Button('Scan##' .. tostring(item.slotid or 'unknown')) then
         ImGui.EndTable()
     end
 end
+
+-- Helper: Return a 3-letter class abbreviation for a bot, when available
+local function get_bot_class_abbrev(botName)
+    local meta = bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[botName]
+    local cls = meta and meta.Class or nil
+    if not cls or cls == '' then return 'UNK' end
+    local up = tostring(cls):upper()
+    local map = {
+        WAR='WAR', WARRIOR='WAR',
+        CLR='CLR', CLERIC='CLR',
+        PAL='PAL', PALADIN='PAL',
+        RNG='RNG', RANGER='RNG',
+        SHD='SHD', ['SHADOW KNIGHT']='SHD', SHADOWKNIGHT='SHD', SK='SHD',
+        DRU='DRU', DRUID='DRU',
+        MNK='MNK', MONK='MNK',
+        BRD='BRD', BARD='BRD',
+        ROG='ROG', ROGUE='ROG',
+        SHM='SHM', SHAMAN='SHM',
+        NEC='NEC', NECROMANCER='NEC',
+        WIZ='WIZ', WIZARD='WIZ',
+        MAG='MAG', MAGICIAN='MAG',
+        ENC='ENC', ENCHANTER='ENC',
+        BST='BST', BEAST='BST', BEASTLORD='BST', BL='BST',
+        BER='BER', BERSERKER='BER',
+    }
+    if map[up] then return map[up] end
+    for key, val in pairs(map) do
+        if up:find(key) then return val end
+    end
+    return 'UNK'
+end
+
+-- Draw the Bot Groups tab
+function drawBotGroupsTab()
+    -- Header with refresh button
+    if ImGui.Button('Refresh Groups') then
+        bot_groups.refresh_groups()
+    end
+    
+    ImGui.SameLine()
+    ImGui.Text(string.format('Groups: %d', #bot_groups.groups))
+    
+    if bot_groups.operationStatus ~= "" then
+        ImGui.SameLine()
+        ImGui.TextColored(0.2, 0.8, 0.2, 1.0, bot_groups.operationStatus)
+    end
+    
+    ImGui.Separator()
+    
+    -- Create new group section
+    ImGui.Text('Create New Group:')
+    ImGui.PushItemWidth(200)
+    bot_groups.newGroupName = ImGui.InputText('##NewGroupName', bot_groups.newGroupName or '')
+    ImGui.SameLine()
+    bot_groups.newGroupDescription = ImGui.InputText('##NewGroupDesc', bot_groups.newGroupDescription or '')
+    ImGui.PopItemWidth()
+    
+    ImGui.SameLine()
+    if ImGui.Button('Create Group') then
+        if bot_groups.newGroupName and bot_groups.newGroupName ~= "" then
+            local ok, result = bot_groups.create_group(bot_groups.newGroupName, bot_groups.newGroupDescription)
+            if ok then
+                bot_groups.newGroupName = ""
+                bot_groups.newGroupDescription = ""
+            else
+                printf('[EmuBot] Failed to create group: %s', tostring(result))
+            end
+        end
+    end
+    
+    ImGui.Separator()
+    
+    -- Groups list
+    if #bot_groups.groups == 0 then
+        ImGui.Text('No groups created yet. Create a group above to get started.')
+        return
+    end
+    
+    -- Groups table
+    if ImGui.BeginTable('GroupsTable', 6, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+        ImGui.TableSetupColumn('Group', ImGuiTableColumnFlags.WidthStretch)
+        ImGui.TableSetupColumn('Members', ImGuiTableColumnFlags.WidthFixed, 80)
+        ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 100)
+        ImGui.TableSetupColumn('Actions', ImGuiTableColumnFlags.WidthStretch)
+        ImGui.TableSetupColumn('Edit', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('Delete', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableHeadersRow()
+        
+        for _, group in ipairs(bot_groups.groups) do
+            ImGui.TableNextRow()
+            ImGui.PushID('group_' .. tostring(group.id))
+            
+            -- Group name and description
+            ImGui.TableNextColumn()
+            ImGui.Text(group.name or 'Unnamed')
+            if group.description and group.description ~= "" then
+                ImGui.Text(group.description)
+            end
+            
+            -- Member count
+            ImGui.TableNextColumn()
+            local memberCount = group.members and #group.members or 0
+            ImGui.Text(tostring(memberCount))
+            
+            -- Status
+            ImGui.TableNextColumn()
+            if memberCount > 0 then
+                local status = bot_groups.get_group_status(group.id)
+                local color = status.percentage == 100 and {0.2, 0.8, 0.2, 1.0} or 
+                              status.percentage > 0 and {0.8, 0.8, 0.2, 1.0} or 
+                              {0.8, 0.2, 0.2, 1.0}
+                ImGui.TextColored(color[1], color[2], color[3], color[4], 
+                    string.format('%d/%d (%d%%)', status.spawned, status.total, status.percentage))
+            else
+                ImGui.TextColored(0.5, 0.5, 0.5, 1.0, 'Empty')
+            end
+            
+            -- Actions
+            ImGui.TableNextColumn()
+            if memberCount > 0 then
+                if ImGui.SmallButton('Spawn') then
+                    bot_groups.spawn_group(group.id)
+                end
+                ImGui.SameLine()
+                if ImGui.SmallButton('Invite') then
+                    bot_groups.invite_group(group.id)
+                end
+                ImGui.SameLine()
+                if ImGui.SmallButton('Spawn & Invite') then
+                    -- Use a non-blocking approach
+                    enqueueTask(function()
+                        bot_groups.spawn_and_invite_group(group.id)
+                    end)
+                end
+            else
+                ImGui.TextColored(0.5, 0.5, 0.5, 1.0, 'No members')
+            end
+            
+            -- Edit button
+            ImGui.TableNextColumn()
+            if ImGui.SmallButton('Edit') then
+                bot_groups.editingGroup = group
+                bot_groups.selectedGroup = group
+            end
+            
+            -- Delete button
+            ImGui.TableNextColumn()
+            if ImGui.SmallButton('Delete') then
+                bot_groups.delete_group(group.id)
+            end
+            
+            ImGui.PopID()
+        end
+        
+        ImGui.EndTable()
+    end
+    
+    -- Group editing section
+    if bot_groups.editingGroup then
+        ImGui.Separator()
+        ImGui.Text(string.format('Editing Group: %s', bot_groups.editingGroup.name or 'Unknown'))
+        
+        -- Available bots list
+        local availableBots = bot_inventory.getAllBots() or {}
+        local currentMembers = {}
+        
+        -- Build current members lookup
+        if bot_groups.editingGroup.members then
+            for _, member in ipairs(bot_groups.editingGroup.members) do
+                currentMembers[member.bot_name] = true
+            end
+        end
+        
+        -- Show current members
+        ImGui.Text('Current Members:')
+        if bot_groups.editingGroup.members and #bot_groups.editingGroup.members > 0 then
+            if ImGui.BeginTable('CurrentMembers', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg) then
+                ImGui.TableSetupColumn('Bot Name', ImGuiTableColumnFlags.WidthStretch)
+                ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
+                ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 80)
+                ImGui.TableSetupColumn('Remove', ImGuiTableColumnFlags.WidthFixed, 60)
+                ImGui.TableHeadersRow()
+                
+                for _, member in ipairs(bot_groups.editingGroup.members) do
+                    ImGui.TableNextRow()
+                    
+                    ImGui.TableNextColumn()
+                    ImGui.Text(member.bot_name)
+                    
+                    ImGui.TableNextColumn()
+                    local cls = get_bot_class_abbrev(member.bot_name)
+                    ImGui.Text(cls)
+                    
+                    ImGui.TableNextColumn()
+                    local spawned = is_bot_spawned(member.bot_name)
+                    if spawned then
+                        ImGui.TextColored(0.2, 0.8, 0.2, 1.0, 'Spawned')
+                    else
+                        ImGui.TextColored(0.8, 0.2, 0.2, 1.0, 'Despawned')
+                    end
+                    
+                    ImGui.TableNextColumn()
+                    ImGui.PushID('remove_' .. member.bot_name)
+                    if ImGui.SmallButton('Remove') then
+                        bot_groups.remove_bot_from_group(bot_groups.editingGroup.id, member.bot_name)
+                        -- Refresh the editing group
+                        for _, g in ipairs(bot_groups.groups) do
+                            if g.id == bot_groups.editingGroup.id then
+                                bot_groups.editingGroup = g
+                                break
+                            end
+                        end
+                    end
+                    ImGui.PopID()
+                end
+                
+                ImGui.EndTable()
+            end
+        else
+            ImGui.Text('No members in this group yet.')
+        end
+        
+        -- Add bots section
+        ImGui.Spacing()
+        ImGui.Text('Add Bots to Group:')
+        
+        if #availableBots > 0 then
+            if ImGui.BeginTable('AvailableBots', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg) then
+                ImGui.TableSetupColumn('Bot Name', ImGuiTableColumnFlags.WidthStretch)
+                ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
+                ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 80)
+                ImGui.TableSetupColumn('Add', ImGuiTableColumnFlags.WidthFixed, 60)
+                ImGui.TableHeadersRow()
+                
+                for _, botName in ipairs(availableBots) do
+                    if not currentMembers[botName] then
+                        ImGui.TableNextRow()
+                        
+                        ImGui.TableNextColumn()
+                        ImGui.Text(botName)
+                        
+                        ImGui.TableNextColumn()
+                        local cls = get_bot_class_abbrev(botName)
+                        ImGui.Text(cls)
+                        
+                        ImGui.TableNextColumn()
+                        local spawned = is_bot_spawned(botName)
+                        if spawned then
+                            ImGui.TextColored(0.2, 0.8, 0.2, 1.0, 'Spawned')
+                        else
+                            ImGui.TextColored(0.8, 0.2, 0.2, 1.0, 'Despawned')
+                        end
+                        
+                        ImGui.TableNextColumn()
+                        ImGui.PushID('add_' .. botName)
+                        if ImGui.SmallButton('Add') then
+                            bot_groups.add_bot_to_group(bot_groups.editingGroup.id, botName)
+                            -- Refresh the editing group
+                            for _, g in ipairs(bot_groups.groups) do
+                                if g.id == bot_groups.editingGroup.id then
+                                    bot_groups.editingGroup = g
+                                    break
+                                end
+                            end
+                        end
+                        ImGui.PopID()
+                    end
+                end
+                
+                ImGui.EndTable()
+            end
+        else
+            ImGui.Text('No bots available. Refresh bot list from the Bot Management tab.')
+        end
+        
+        -- Close editing
+        ImGui.Spacing()
+        if ImGui.Button('Done Editing') then
+            bot_groups.editingGroup = nil
+        end
+    end
+end
+
+function is_bot_spawned(name)
+    local s = mq.TLO.Spawn(string.format('= %s', name))
+    return s and s.ID and s.ID() and s.ID() > 0
+end
+
 
 function botUI.drawBotInventoryWindow()
     if not botUI.showWindow then return end
@@ -2241,7 +2546,7 @@ if ImGui.Button('Close Window', buttonWidth, 0) then
         
         -- Toggle switch for disable camp setting
         ImGui.SameLine()
-        ImGui.Text('No Camp:')
+        ImGui.Text('Camp After Scan?:')
         ImGui.SameLine()
         
         -- Create a styled toggle switch
@@ -2273,6 +2578,54 @@ if ImGui.Button('Close Window', buttonWidth, 0) then
         
         if ImGui.IsItemHovered() then
             ImGui.SetTooltip('Toggle: Disable camping bots after scan (useful when scanning fewer than spawn limit)')
+        end
+        
+        -- Quick Groups section
+        if #bot_groups.groups > 0 then
+            ImGui.SameLine()
+            ImGui.Text('Quick Groups:')
+            ImGui.SameLine()
+            
+            -- Show first few groups with quick spawn buttons
+            local groupsShown = 0
+            for _, group in ipairs(bot_groups.groups) do
+                if groupsShown >= 3 then break end -- Limit to 3 groups to avoid UI clutter
+                if group.members and #group.members > 0 then
+                    ImGui.SameLine()
+                    local status = bot_groups.get_group_status(group.id)
+                    local buttonText = string.format('%s (%d/%d)', group.name, status.spawned, status.total)
+                    
+                    -- Color button based on spawn status
+                    if status.percentage == 100 then
+                        ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.7, 0.2, 0.8)
+                        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.3, 0.8, 0.3, 0.9)
+                        ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.1, 0.6, 0.1, 1.0)
+                    elseif status.percentage > 0 then
+                        ImGui.PushStyleColor(ImGuiCol.Button, 0.8, 0.6, 0.2, 0.8)
+                        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.9, 0.7, 0.3, 0.9)
+                        ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.7, 0.5, 0.1, 1.0)
+                    else
+                        ImGui.PushStyleColor(ImGuiCol.Button, 0.6, 0.6, 0.6, 0.8)
+                        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.7, 0.7, 0.7, 0.9)
+                        ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.5, 0.5, 0.5, 1.0)
+                    end
+                    
+                    if ImGui.SmallButton(buttonText) then
+                        enqueueTask(function()
+                            bot_groups.spawn_and_invite_group(group.id)
+                        end)
+                    end
+                    
+                    ImGui.PopStyleColor(3)
+                    
+                    if ImGui.IsItemHovered() then
+                        ImGui.SetTooltip(string.format('Spawn and invite group "%s"\n%d members (%d%% spawned)', 
+                            group.name, status.total, status.percentage))
+                    end
+                    
+                    groupsShown = groupsShown + 1
+                end
+            end
         end
         
         -- Show progress if scan is active
@@ -2323,6 +2676,11 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
 
             if ImGui.BeginTabItem('Bot Management') then
                 bot_management.draw()
+                ImGui.EndTabItem()
+            end
+            
+            if ImGui.BeginTabItem('Bot Groups') then
+                drawBotGroupsTab()
                 ImGui.EndTabItem()
             end
 
@@ -2618,6 +2976,7 @@ local function drawUpgradeQuickButton()
     ImGui.PopStyleVar(3)
 end
 
+
 function botUI.render()
     -- Draw floating toggles even if main window is closed
     drawFloatingToggle()
@@ -2765,6 +3124,7 @@ local function main()
     refreshBotList()
 
     -- Initialize optional modules
+    if bot_groups and bot_groups.init then bot_groups.init() end
     if upgrade and upgrade.init then upgrade.init() end
 
     mq.imgui.init('EmuBot', function()
@@ -2774,6 +3134,7 @@ local function main()
     while true do
         mq.doevents()
         bot_inventory.process()
+        bot_groups.process_invitations()
         processDeferredTasks()
         mq.delay(50)
     end
