@@ -384,13 +384,16 @@ end
 local function draw_settings_window()
     if not state.showSettings then return end
     ImGui.SetNextWindowSize(640, 540, ImGuiCond.FirstUseEver)
+    -- Apply same theming as HotBar
+    push_styles()
     local isOpen, shouldDraw = ImGui.Begin('Bot HotBar Settings', true, ImGuiWindowFlags.None)
     if not isOpen then
         state.showSettings = false
         ImGui.End()
+        pop_styles()
         return
     end
-    if not shouldDraw then ImGui.End(); return end
+    if not shouldDraw then ImGui.End(); pop_styles(); return end
 
     -- Left nav (sections & keys)
     local leftWidth = 220
@@ -563,10 +566,11 @@ local function draw_settings_window()
         for _, cat in ipairs(orderedCats) do
             if (not state._repoCategory) or state._repoCategory == cat then
                 if ImGui.CollapsingHeader(cat, ImGuiTreeNodeFlags.DefaultOpen) then
-                    if ImGui.BeginTable('Repo_'..cat, 3, bit32.bor(ImGuiTableFlags.RowBg, ImGuiTableFlags.BordersOuter, ImGuiTableFlags.BordersV, ImGuiTableFlags.Resizable)) then
+                    if ImGui.BeginTable('Repo_'..cat, 4, bit32.bor(ImGuiTableFlags.RowBg, ImGuiTableFlags.BordersOuter, ImGuiTableFlags.BordersV, ImGuiTableFlags.Resizable)) then
                         ImGui.TableSetupColumn('Label', ImGuiTableColumnFlags.WidthStretch)
                         ImGui.TableSetupColumn('Category', ImGuiTableColumnFlags.WidthFixed, 120)
                         ImGui.TableSetupColumn('Add', ImGuiTableColumnFlags.WidthFixed, 80)
+                        ImGui.TableSetupColumn('Do It', ImGuiTableColumnFlags.WidthFixed, 80)
                         ImGui.TableHeadersRow()
                         local exists = {}; for _, id in ipairs(config.hotbar.items or {}) do exists[id]=true end
                         for _, it in ipairs(groups[cat]) do
@@ -576,6 +580,16 @@ local function draw_settings_window()
                             local disabled = exists[it.id]; if disabled then ImGui.BeginDisabled(true) end
                             if ImGui.SmallButton('Add') and not disabled then table.insert(config.hotbar.items, it.id) end
                             if disabled then ImGui.EndDisabled() end
+                            ImGui.PopID()
+                            -- Do It button to execute the command/actions immediately
+                            ImGui.TableNextColumn(); ImGui.PushID('do_'..it.id)
+                            if ImGui.SmallButton('Do It') then
+                                if it.id == 'spawn_missing_party_bots' then
+                                    local a = build_spawn_missing_actions(); if a and #a > 0 then schedule_actions(a) end
+                                else
+                                    if it.actions and #it.actions > 0 then schedule_actions(it.actions) end
+                                end
+                            end
                             ImGui.PopID()
                         end
                         ImGui.EndTable()
@@ -599,6 +613,8 @@ local function draw_settings_window()
     ImGui.EndChild()
 
     ImGui.End()
+    -- Pop theming styles
+    pop_styles()
 end
 
 -- Helper: get U32 from color table

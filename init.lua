@@ -43,7 +43,7 @@ local ICON_HEIGHT = 20
 local animItems = mq.FindTextureAnimation('A_DragItem')
 
 local botUI = {
-    showWindow = true,
+    showWindow = false,
     botFetchDelay = 1.0,
     botSpawnDelay = 2.0,
     botTargetDelay = 1.0,
@@ -1698,14 +1698,11 @@ local function drawVisualTab(equippedItems)
         if slotId then slotMap[slotId] = it end
     end
 
-    local cellSize = 48
+    local cellSize = 44
     local gridWidth = (cellSize + 4) * 4
 
-    if ImGui.BeginTable('BotEquipLayout', 2, ImGuiTableFlags.Resizable + ImGuiTableFlags.SizingStretchProp) then
-        ImGui.TableSetupColumn('BotGrid', ImGuiTableColumnFlags.WidthFixed, gridWidth)
-        ImGui.TableSetupColumn('BotCompare', ImGuiTableColumnFlags.WidthStretch)
-        ImGui.TableNextRow()
-        ImGui.TableNextColumn()
+    -- Left child: Equipped grid
+    if ImGui.BeginChild('BotVisLeft', 250, 420, true) then
         if ImGui.BeginTable('BotEquippedVisual', 4,
             ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.SizingFixedFit) then
             for _, row in ipairs(slotLayout) do
@@ -1770,10 +1767,13 @@ local function drawVisualTab(equippedItems)
             end
             ImGui.EndTable()
         end
+    end
+    ImGui.EndChild()
 
-        ImGui.TableNextColumn()
-        ImGui.BeginChild('BotComparisonColumn', 0, 0)
+    ImGui.SameLine()
 
+    -- Right child: Comparison
+    if ImGui.BeginChild('BotVisRight', 0, 420, true) then
         if botUI.selectedBotSlotID then
             local slotName = botUI.selectedBotSlotName or getSlotName(botUI.selectedBotSlotID)
             local slotResults = collectBotSlotItems(botUI.selectedBotSlotID)
@@ -1785,7 +1785,7 @@ local function drawVisualTab(equippedItems)
                 botUI.selectedBotSlotName = nil
                 slotResults = {}
             end
-ImGui.SameLine()
+            ImGui.SameLine()
             if ImGui.SmallButton('Scan Items##BotSlotScan') then
                 local seen = {}
                 local pending = {}
@@ -1862,7 +1862,6 @@ ImGui.SameLine()
                                     mq.ExecuteTextLink(links[1])
                                 end
                             elseif rightClicked then
-                                -- Right-click detected - scan local inventory for compatible items
                                 botUI.rightClickedBotItem = entry.item
                                 local slotId = entry.item.slotid
                                 botUI.localCompareItems = botUI.findLocalItemsForSlot(slotId, entry.item, entry.bot)
@@ -1905,18 +1904,18 @@ ImGui.SameLine()
                     ImGui.EndTable()
                 end
             end
+        else
+            ImGui.Text('Select a slot in the grid to compare across bots.')
         end
-
-        ImGui.EndChild()
-        ImGui.EndTable()
     end
+    ImGui.EndChild()
 end
 
 local function drawTableTab(equippedItems)
     if ImGui.BeginTable('BotEquippedTable', 7,
         ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 100)
-        ImGui.TableSetupColumn('Icon ID', ImGuiTableColumnFlags.WidthFixed, 80)
+        ImGui.TableSetupColumn('Icon', ImGuiTableColumnFlags.WidthFixed, 48)
         ImGui.TableSetupColumn('Item Name', ImGuiTableColumnFlags.WidthStretch)
         ImGui.TableSetupColumn('AC', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 70)
@@ -1935,7 +1934,11 @@ local function drawTableTab(equippedItems)
             ImGui.TableNextColumn()
             local iconId = tonumber(item.icon or item.iconID or 0) or 0
             if iconId > 0 then
-                ImGui.Text(tostring(iconId))
+                if drawItemIcon then
+                    drawItemIcon(iconId, 24, 24)
+                else
+                    ImGui.Text(tostring(iconId))
+                end
             else
                 ImGui.Text('-')
             end
@@ -2664,10 +2667,6 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                 ImGui.EndTabItem()
             end
 
-            if ImGui.BeginTabItem('Upgrades') then
-                upgrade.draw_tab()
-                ImGui.EndTabItem()
-            end
 
             if ImGui.BeginTabItem('Settings/Utils') then
                 local res1, res2 = ImGui.SliderFloat('Fetch Interval (sec)##BotFetchDelay', botUI.botFetchDelay, 0.1, 5.0, '%.1f')

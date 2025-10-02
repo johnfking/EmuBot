@@ -3,8 +3,52 @@
 
 local mq = require('mq')
 local bot_inventory = require('EmuBot.modules.bot_inventory')
+local race_class_utils = require('EmuBot.modules.race_class_utils')
 
 local M = {}
+
+-- Canonical class names (ordered longest first to prefer multi-word matches)
+local CLASS_NAMES = {
+    'Shadow Knight',
+    'Necromancer',
+    'Beastlord',
+    'Berserker',
+    'Magician',
+    'Enchanter',
+    'Paladin',
+    'Ranger',
+    'Warrior',
+    'Cleric',
+    'Shaman',
+    'Wizard',
+    'Druid',
+    'Monk',
+    'Rogue',
+    'Bard',
+}
+
+local function canonicalize_class(raw)
+    if not raw or raw == '' then return nil end
+    local s = tostring(raw)
+    -- Exact match first
+    for _, cname in ipairs(CLASS_NAMES) do
+        if s:lower() == cname:lower() then return cname end
+    end
+    -- Substring match (handles things like 'Elf Rogue', 'Shir Bard')
+    local low = s:lower()
+    for _, cname in ipairs(CLASS_NAMES) do
+        local cl = cname:lower()
+        if low:find(cl, 1, true) then
+            return cname
+        end
+    end
+    -- Fallback: strip first word (race) and try again
+    local withoutFirst = s:gsub('^%S+%s+', '')
+    if withoutFirst ~= s then
+        return canonicalize_class(withoutFirst)
+    end
+    return s
+end
 
 -- Bot creation state
 M.showCreateDialog = false
@@ -27,6 +71,9 @@ M.races = {
 M.genders = {
     "Male", "Female"
 }
+
+-- UI state: current class filter (nil = all)
+M.classFilter = nil
 
 -- Convert selections to numeric IDs for ^botcreate command
 -- Based on EverQuest class IDs
@@ -51,6 +98,35 @@ M.genderIDs = {
 
 local function printf(fmt, ...)
     if mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end
+end
+
+-- Seed RNG once per module load
+math.randomseed(os.time())
+
+-- EverQuest-style random name generator
+local function generate_random_name()
+    local consonants = {'b','c','d','f','g','h','j','k','l','m','n','p','r','s','t','v','w','x','z'}
+    local blends = {'br','cr','dr','fr','gr','pr','tr','bl','cl','fl','gl','pl','sl','th','sh','ch','qu','kh','ph'}
+    local vowels = {'a','e','i','o','u','ae','ei'}
+    local endings = {'or','ar','ir','us','an','en','on','in','el','il','ax','ex','ix','ius','ian','wyn','ryn','thar','dor','nor'}
+
+    local name = ''
+    local syllables = math.random(2,3)
+    for i=1,syllables do
+        if math.random() > 0.3 then
+            if math.random() > 0.6 then name = name .. blends[math.random(#blends)]
+            else name = name .. consonants[math.random(#consonants)] end
+        end
+        name = name .. vowels[math.random(#vowels)]
+        if i < syllables and math.random() > 0.5 then
+            name = name .. consonants[math.random(#consonants)]
+        end
+    end
+    if math.random() > 0.6 then name = name .. endings[math.random(#endings)] end
+    name = name:sub(1,1):upper() .. name:sub(2)
+    if #name > 12 then name = name:sub(1,12) end
+    if #name < 6 then name = name .. endings[math.random(#endings)] end
+    return name
 end
 
 local function is_bot_spawned(name)
@@ -152,107 +228,260 @@ function M.draw()
     ImGui.Separator()
 
     local bots = bot_inventory.getAllBots() or {}
-    if #bots == 0 then
-        ImGui.Text('No bots found. Click "Refresh Bot List" to capture bots, or create one below.')
-        -- Do not return here if create dialog is open
-        if not M.showCreateDialog then
-            -- Still allow opening the create dialog even when list is empty
-            -- Show a hint button to open the dialog
-            if ImGui.Button('Create New Bot##empty') then
-                M.showCreateDialog = true
-            end
-            -- Without an open dialog, we can early-out
-            return
+    -- Note: We continue even if bots list is empty, to show the create panel
+
+    -- Build class counts from captured bot list metadata
+    local classCounts = {}
+    local totalBots = 0
+    local filteredBots = {}
+    for _, name in ipairs(bots) do
+        local meta = bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[name]
+        local rawClass = meta and meta.Class and tostring(meta.Class) or nil
+        local cls = canonicalize_class(rawClass or '') or 'Unknown'
+        classCounts[cls] = (classCounts[cls] or 0) + 1
+        totalBots = totalBots + 1
+        if (not M.classFilter) or (cls == M.classFilter) then
+            table.insert(filteredBots, name)
         end
     end
+    -- Alphabetized class list for display (include all, even zero counts)
+    local classList = {}
+    for _, cname in ipairs(CLASS_NAMES) do table.insert(classList, cname) end
+    table.sort(classList)
 
-    if ImGui.BeginTable('BotManagementTable', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
-        ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthStretch)
-        ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 100)
-        ImGui.TableSetupColumn('Actions', ImGuiTableColumnFlags.WidthStretch)
-        ImGui.TableSetupColumn('Target', ImGuiTableColumnFlags.WidthFixed, 70)
-        ImGui.TableHeadersRow()
+    -- Two-pane layout: left (class counts), right (table)
+    local availW = ImGui.GetWindowWidth() or 800
+    local style = ImGui.GetStyle()
+    local rowH = (ImGui.GetTextLineHeight and ImGui.GetTextLineHeight() or 18) + ((style and style.ItemSpacing and style.ItemSpacing.y) or 4)
+    local headerH = (ImGui.GetTextLineHeight and ImGui.GetTextLineHeight() or 18) * 1.8
+    local rows = #filteredBots
+    local targetH = math.min(420, math.max(180, headerH + rowH * rows + 20))
 
-        for _, name in ipairs(bots) do
-            ImGui.TableNextRow()
-            ImGui.PushID('mgmt_' .. name)
+    local leftW = 200
+    local gap = 10
+    local rightW = math.max(520, math.min(820, availW - leftW - gap - 20))
 
-            -- Bot name
-            ImGui.TableNextColumn()
-            ImGui.Text(name)
-
-            -- Status
-            ImGui.TableNextColumn()
-            if is_bot_spawned(name) then
-                ImGui.TextColored(0.2, 0.8, 0.2, 1.0, 'Spawned')
-            else
-                ImGui.TextColored(0.8, 0.2, 0.2, 1.0, 'Despawned')
-            end
-
-            -- Actions
-            ImGui.TableNextColumn()
-            if ImGui.SmallButton('Spawn') then action_spawn(name) end
-            ImGui.SameLine()
-            if ImGui.SmallButton('Invite') then action_invite(name) end
-            ImGui.SameLine()
-            if ImGui.SmallButton('Camp') then action_camp(name) end
-
-            -- Target helper
-            ImGui.TableNextColumn()
-            if ImGui.SmallButton('Target') then
-                target_bot(name)
-            end
-
-            ImGui.PopID()
-        end
-
-        ImGui.EndTable()
-    end
-    
-    -- Inline Bot Creation Section
-    if M.showCreateDialog then
+    -- Left pane: class counts (aligned two-column table)
+    if ImGui.BeginChild('##BotMgmtClasses', leftW, 410, ImGuiChildFlags.Border) then
+        ImGui.Text('Classes')
         ImGui.Separator()
-        ImGui.Text('Create New Bot:')
-        
-        -- Create form in a table layout for compactness
-        if ImGui.BeginTable('CreateBotTable', 4, ImGuiTableFlags.None) then
-            ImGui.TableSetupColumn('Label1', ImGuiTableColumnFlags.WidthFixed, 60)
-            ImGui.TableSetupColumn('Input1', ImGuiTableColumnFlags.WidthFixed, 150)
-            ImGui.TableSetupColumn('Label2', ImGuiTableColumnFlags.WidthFixed, 60)
-            ImGui.TableSetupColumn('Input2', ImGuiTableColumnFlags.WidthFixed, 100)
-            
-            -- Row 1: Name and Class
+        local shown = 0
+        if ImGui.BeginTable('BotMgmtClassCounts', 2, ImGuiTableFlags.RowBg + ImGuiTableFlags.SizingFixedFit) then
+            ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthStretch)
+            ImGui.TableSetupColumn('#', ImGuiTableColumnFlags.WidthFixed, 36)
+            -- 'All' row to clear filter
             ImGui.TableNextRow()
-            ImGui.TableNextColumn()
-            ImGui.Text('Name:')
-            ImGui.TableNextColumn()
-            ImGui.PushItemWidth(-1)
-            M.newBotName = ImGui.InputText('##BotName', M.newBotName or '')
-            ImGui.PopItemWidth()
-            ImGui.TableNextColumn()
-            ImGui.Text('Class:')
-            ImGui.TableNextColumn()
-            ImGui.PushItemWidth(80)
-            M.selectedClass = ImGui.Combo('##ClassCombo', M.selectedClass, M.classes, #M.classes)
-            ImGui.PopItemWidth()
-            
-            -- Row 2: Race and Gender
-            ImGui.TableNextRow()
-            ImGui.TableNextColumn()
-            ImGui.Text('Race:')
-            ImGui.TableNextColumn()
-            ImGui.PushItemWidth(-1)
-            M.selectedRace = ImGui.Combo('##RaceCombo', M.selectedRace, M.races, #M.races)
-            ImGui.PopItemWidth()
-            ImGui.TableNextColumn()
-            ImGui.Text('Gender:')
-            ImGui.TableNextColumn()
-            ImGui.PushItemWidth(80)
-            M.selectedGender = ImGui.Combo('##GenderCombo', M.selectedGender, M.genders, #M.genders)
-            ImGui.PopItemWidth()
-            
+            ImGui.TableNextColumn();
+            local allSel = (M.classFilter == nil)
+            if ImGui.Selectable('All', allSel, ImGuiSelectableFlags.SpanAllColumns) then
+                M.classFilter = nil
+            end
+            ImGui.TableNextColumn(); ImGui.Text(string.format('%d', totalBots))
+            shown = shown + 1
+            -- Class rows
+            for _, cname in ipairs(classList) do
+                local cnt = classCounts[cname] or 0
+                ImGui.TableNextRow()
+                ImGui.TableNextColumn();
+                local isSel = (M.classFilter == cname)
+                if ImGui.Selectable(cname, isSel, ImGuiSelectableFlags.SpanAllColumns) then
+                    M.classFilter = cname
+                end
+                ImGui.TableNextColumn(); ImGui.Text(string.format('%d', cnt))
+                shown = shown + 1
+            end
             ImGui.EndTable()
         end
+        ImGui.Separator()
+        if ImGui.BeginTable('BotMgmtClassTotal', 2, ImGuiTableFlags.SizingFixedFit) then
+            ImGui.TableSetupColumn('Label', ImGuiTableColumnFlags.WidthStretch)
+            ImGui.TableSetupColumn('Val', ImGuiTableColumnFlags.WidthFixed, 36)
+            ImGui.TableNextRow()
+            ImGui.TableNextColumn(); ImGui.Text('Total')
+            ImGui.TableNextColumn(); ImGui.Text(string.format('%d', totalBots))
+            ImGui.EndTable()
+        end
+    end
+    ImGui.EndChild()
+
+    ImGui.SameLine()
+
+    -- Right pane: contained table
+    if ImGui.BeginChild('##BotMgmtContainer', 400, 410, ImGuiChildFlags.Border) then
+        if ImGui.BeginTable('BotManagementTable', 3, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.SizingFixedFit) then
+            ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthStretch)
+            ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 110)
+            ImGui.TableSetupColumn('Actions', ImGuiTableColumnFlags.WidthStretch)
+            ImGui.TableHeadersRow()
+
+            for _, name in ipairs(filteredBots) do
+                ImGui.TableNextRow()
+                ImGui.PushID('mgmt_' .. name)
+
+                -- Bot name (colored by spawn state, selectable targets)
+                ImGui.TableNextColumn()
+                if is_bot_spawned(name) then
+                    ImGui.PushStyleColor(ImGuiCol.Text, 0.2, 0.8, 0.2, 1.0)
+                else
+                    ImGui.PushStyleColor(ImGuiCol.Text, 0.8, 0.2, 0.2, 1.0)
+                end
+                if ImGui.Selectable(name, false) then
+                    target_bot(name)
+                end
+                ImGui.PopStyleColor(1)
+
+                -- Class (from captured bot list meta)
+                ImGui.TableNextColumn()
+                do
+                    local cls = nil
+                    local meta = bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[name]
+                    if meta then
+                        local rawClass = meta.Class and tostring(meta.Class) or nil
+                        if rawClass and rawClass ~= '' then
+                            cls = canonicalize_class(rawClass)
+                        end
+                    end
+                    ImGui.Text(cls or '-')
+                end
+
+                -- Actions
+                ImGui.TableNextColumn()
+                if ImGui.SmallButton('Spawn') then action_spawn(name) end
+                ImGui.SameLine()
+                if ImGui.SmallButton('Invite') then action_invite(name) end
+                ImGui.SameLine()
+                if ImGui.SmallButton('Camp') then action_camp(name) end
+
+                ImGui.PopID()
+            end
+
+            ImGui.EndTable()
+        end
+    end
+    ImGui.EndChild()
+    
+    ImGui.SameLine()
+    
+    -- Right pane: Create New Bot
+if ImGui.BeginChild('##BotMgmtCreate', 300, 410, ImGuiChildFlags.Border) then
+        ImGui.Text('Create New Bot')
+        ImGui.Separator()
+        
+        -- Name with random generator
+        ImGui.Text('Name:')
+        ImGui.PushItemWidth(200)  -- Fixed width for input leaving room for button
+        M.newBotName = ImGui.InputText('##BotName', M.newBotName or '')
+        ImGui.PopItemWidth()
+        ImGui.SameLine()
+        if ImGui.Button('Random ##RandomName', 80, 0) then
+            M.newBotName = generate_random_name()
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Generate random fantasy name')
+        end
+        
+        ImGui.Spacing()
+        
+        -- Class (blank until selected; filters after race selection)
+        ImGui.Text('Class:')
+        do
+            ImGui.PushItemWidth(-1)
+            local raceIndex = tonumber(M.selectedRace or 0) or 0
+            local source = {}
+            if raceIndex > 0 then
+                local raceCode = M.races[raceIndex]
+                source = race_class_utils.allowed_classes_for_race(raceCode)
+            else
+                source = M.classes
+            end
+            -- Build sorted view with placeholder first
+            local sorted = {}
+            for _, v in ipairs(source or {}) do table.insert(sorted, v) end
+            table.sort(sorted, function(a,b) return tostring(a) < tostring(b) end)
+            local view = {'-- Select Class --'}
+            for _, v in ipairs(sorted) do table.insert(view, v) end
+            -- Current index based on existing selected class code
+            local currentCode = (tonumber(M.selectedClass or 0) or 0) > 0 and M.classes[M.selectedClass] or nil
+            local currentIndex = 1
+            if currentCode then
+                for i, code in ipairs(sorted) do if code == currentCode then currentIndex = i + 1; break end end
+            end
+            local newIndex, changed = ImGui.Combo('##ClassCombo', currentIndex, view, #view)
+            if changed and newIndex then
+                if newIndex == 1 then
+                    M.selectedClass = 0
+                else
+                    local chosen = sorted[newIndex - 1]
+                    for i, code in ipairs(M.classes) do if code == chosen then M.selectedClass = i; break end end
+                    -- If a race is selected but now invalid with this class, clear race
+                    if (tonumber(M.selectedRace or 0) or 0) > 0 then
+                        local raceCode = M.races[M.selectedRace]
+                        if not race_class_utils.is_valid_combo(raceCode, chosen) then
+                            M.selectedRace = 0
+                        end
+                    end
+                end
+            end
+            ImGui.PopItemWidth()
+        end
+        
+        ImGui.Spacing()
+        
+        -- Race (blank until selected; filters after class selection)
+        ImGui.Text('Race:')
+        do
+            ImGui.PushItemWidth(-1)
+            local classIndex = tonumber(M.selectedClass or 0) or 0
+            local source = {}
+            if classIndex > 0 then
+                local classCode = M.classes[classIndex]
+                source = race_class_utils.allowed_races_for_class(classCode)
+            else
+                source = M.races
+            end
+            local sorted = {}
+            for _, v in ipairs(source or {}) do table.insert(sorted, v) end
+            table.sort(sorted, function(a,b)
+                local A = race_class_utils.RACE_NAMES[a] or a
+                local B = race_class_utils.RACE_NAMES[b] or b
+                return tostring(A) < tostring(B)
+            end)
+            local view = {'-- Select Race --'}
+            for _, v in ipairs(sorted) do table.insert(view, v) end
+            local currentCode = (tonumber(M.selectedRace or 0) or 0) > 0 and M.races[M.selectedRace] or nil
+            local currentIndex = 1
+            if currentCode then
+                for i, code in ipairs(sorted) do if code == currentCode then currentIndex = i + 1; break end end
+            end
+            local newIndex, changed = ImGui.Combo('##RaceCombo', currentIndex, view, #view)
+            if changed and newIndex then
+                if newIndex == 1 then
+                    M.selectedRace = 0
+                else
+                    local chosen = sorted[newIndex - 1]
+                    for i, code in ipairs(M.races) do if code == chosen then M.selectedRace = i; break end end
+                    -- If a class is selected but now invalid with this race, clear class
+                    if (tonumber(M.selectedClass or 0) or 0) > 0 then
+                        local classCode = M.classes[M.selectedClass]
+                        if not race_class_utils.is_valid_combo(chosen, classCode) then
+                            M.selectedClass = 0
+                        end
+                    end
+                end
+            end
+            ImGui.PopItemWidth()
+        end
+        
+        ImGui.Spacing()
+        
+        -- Gender
+        ImGui.Text('Gender:')
+        ImGui.PushItemWidth(-1)
+        M.selectedGender = ImGui.Combo('##GenderCombo', M.selectedGender, M.genders, #M.genders)
+        ImGui.PopItemWidth()
+        
+        ImGui.Spacing()
+        ImGui.Separator()
         
         -- Preview the command
         if M.newBotName and M.newBotName ~= '' then
@@ -268,15 +497,26 @@ function M.draw()
                 M.newBotName, classID, raceID, genderID)
             
             ImGui.TextColored(0.7, 0.7, 0.7, 1.0, 'Command:')
-            ImGui.SameLine()
-            ImGui.TextColored(0.9, 0.9, 0.5, 1.0, previewCommand)
-            ImGui.SameLine()
-            ImGui.TextColored(0.6, 0.6, 0.6, 1.0, string.format('(%s=%d, %s=%d, %s=%d)', 
-                selectedClassName, classID, selectedRaceName, raceID, selectedGenderName, genderID))
+            ImGui.TextWrapped(previewCommand)
+            ImGui.Spacing()
         end
         
         -- Buttons
         local canCreate = M.newBotName and M.newBotName ~= ''
+        -- Also require explicit selections and validate only when both are chosen
+        do
+            local raceIndex = tonumber(M.selectedRace or 0) or 0
+            local classIndex = tonumber(M.selectedClass or 0) or 0
+            if raceIndex <= 0 or classIndex <= 0 then
+                canCreate = false
+            else
+                local raceCode = M.races[raceIndex]
+                local classCode = M.classes[classIndex]
+                if not race_class_utils.is_valid_combo(raceCode, classCode) then
+                    canCreate = false
+                end
+            end
+        end
         
         if not canCreate then
             ImGui.PushStyleColor(ImGuiCol.Button, 0.5, 0.5, 0.5, 0.5)
@@ -284,7 +524,7 @@ function M.draw()
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.5, 0.5, 0.5, 0.5)
         end
         
-        if ImGui.Button('Create Bot') then
+        if ImGui.Button('Create Bot', -1, 0) then
             if canCreate then
                 local selectedClassName = M.classes[M.selectedClass] or 'WAR'
                 local selectedRaceName = M.races[M.selectedRace] or 'HUM'
@@ -297,7 +537,6 @@ function M.draw()
                     M.selectedClass = 0
                     M.selectedRace = 0
                     M.selectedGender = 0
-                    M.showCreateDialog = false
                 end
             end
         end
@@ -307,22 +546,31 @@ function M.draw()
         end
         
         if ImGui.IsItemHovered() and not canCreate then
-            ImGui.SetTooltip('Please enter a bot name')
+            local raceIndex = tonumber(M.selectedRace or 0) or 0
+            local classIndex = tonumber(M.selectedClass or 0) or 0
+            local reason = 'Please enter a bot name'
+            if M.newBotName and M.newBotName ~= '' then
+                if raceIndex <= 0 or classIndex <= 0 then
+                    reason = 'Select a race and class'
+                else
+                    local raceCode = M.races[raceIndex]
+                    local classCode = M.classes[classIndex]
+                    if not race_class_utils.is_valid_combo(raceCode, classCode) then
+                        reason = string.format('Invalid combo: %s + %s', raceCode, classCode)
+                    end
+                end
+            end
+            ImGui.SetTooltip(reason)
         end
         
-        ImGui.SameLine()
-        
-        if ImGui.Button('Cancel') then
-            M.showCreateDialog = false
-            -- Reset form when canceling
+        if ImGui.Button('Clear', -1, 0) then
             M.newBotName = ''
             M.selectedClass = 0
             M.selectedRace = 0
             M.selectedGender = 0
         end
-        
-        ImGui.Separator()
     end
+    ImGui.EndChild()
 end
 
 return M

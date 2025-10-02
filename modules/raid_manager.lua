@@ -15,6 +15,8 @@ M.desiredLayout = {}
 M.includeBench = true
 M.statusText = ""
 M._meSeeded = false
+-- UI: number of raid groups to display in the layout grid (1-12)
+M.groupsToDisplay = 12
 
 -- forward declarations
 local inDesired
@@ -66,7 +68,9 @@ M._savedLayouts = {}
 function M.load_saved_layouts()
     local p = layouts_path()
     local f = io.open(p, 'r')
-    if not f then M._savedLayouts = {}; return end
+    if not f then
+        M._savedLayouts = {}; return
+    end
     local content = f:read('*a') or ''
     f:close()
     local data = json.decode(content) or {}
@@ -76,23 +80,27 @@ end
 local function deepcopy(tbl)
     if type(tbl) ~= 'table' then return tbl end
     local t = {}
-    for k,v in pairs(tbl) do t[k] = deepcopy(v) end
+    for k, v in pairs(tbl) do t[k] = deepcopy(v) end
     return t
 end
 
 function M.save_current_layout(name)
-    if not name or name == '' then M.statusText = 'Enter a layout name.'; return false end
+    if not name or name == '' then
+        M.statusText = 'Enter a layout name.'; return false
+    end
     -- normalize layout to 12x6 structure
     local out = {}
-    for g=1,12 do
+    for g = 1, 12 do
         out[g] = {}
-        for s=1,6 do out[g][s] = M.desiredLayout[g] and M.desiredLayout[g][s] or nil end
+        for s = 1, 6 do out[g][s] = M.desiredLayout[g] and M.desiredLayout[g][s] or nil end
     end
     M._savedLayouts[name] = out
     local p = layouts_path()
     local f = io.open(p, 'w')
-    if not f then M.statusText = 'Failed to open raid_layouts.json for write'; return false end
-    f:write(json.encode(M._savedLayouts, {indent=true}))
+    if not f then
+        M.statusText = 'Failed to open raid_layouts.json for write'; return false
+    end
+    f:write(json.encode(M._savedLayouts, { indent = true }))
     f:close()
     M.statusText = string.format('Saved layout "%s"', name)
     return true
@@ -100,7 +108,9 @@ end
 
 function M.load_layout(name)
     local layout = M._savedLayouts[name]
-    if not layout then M.statusText = 'Layout not found'; return false end
+    if not layout then
+        M.statusText = 'Layout not found'; return false
+    end
     M.desiredLayout = deepcopy(layout)
     M.statusText = string.format('Loaded layout "%s"', name)
     return true
@@ -111,7 +121,9 @@ function M.delete_layout(name)
     M._savedLayouts[name] = nil
     local p = layouts_path()
     local f = io.open(p, 'w')
-    if f then f:write(json.encode(M._savedLayouts, {indent=true})); f:close() end
+    if f then
+        f:write(json.encode(M._savedLayouts, { indent = true })); f:close()
+    end
     M.statusText = string.format('Deleted layout "%s"', name)
 end
 
@@ -129,7 +141,7 @@ local function listSelectedBots()
             end
         end
     end
-    table.sort(names, function(a,b) return a:lower() < b:lower() end)
+    table.sort(names, function(a, b) return a:lower() < b:lower() end)
     return names
 end
 
@@ -157,7 +169,7 @@ local function unassignedAllBots()
     if bot_inventory and bot_inventory.getAllBots then
         all = bot_inventory.getAllBots() or {}
     end
-    table.sort(all, function(a,b) return tostring(a):lower() < tostring(b):lower() end)
+    table.sort(all, function(a, b) return tostring(a):lower() < tostring(b):lower() end)
     local res = {}
     for _, name in ipairs(all) do
         if not inDesired(name) then table.insert(res, name) end
@@ -182,7 +194,9 @@ local function autofill()
         if not me or name ~= me then
             M.desiredLayout[gi][si] = name
             si = si + 1
-            if si > 6 then gi = gi + 1; si = 1 end
+            if si > 6 then
+                gi = gi + 1; si = 1
+            end
             if gi > 12 then break end
         end
     end
@@ -251,8 +265,8 @@ end
 local function getLayoutBotList()
     local set = {}
     local list = {}
-    for g=1,12 do
-        for s=1,6 do
+    for g = 1, 12 do
+        for s = 1, 6 do
             local n = M.desiredLayout[g] and M.desiredLayout[g][s]
             if n and n ~= '' and not set[n] then
                 set[n] = true
@@ -265,7 +279,9 @@ end
 
 function M.formRaidForSelected()
     local bots = listSelectedBots()
-    if #bots == 0 then M.statusText = 'No bots selected.'; return end
+    if #bots == 0 then
+        M.statusText = 'No bots selected.'; return
+    end
     openRaidWindow(); raidUnlock()
     for _, n in ipairs(bots) do
         spawnIfNeeded(n)
@@ -295,7 +311,9 @@ end
 -- Combined: spawn/invite all bots present in the layout, then arrange into groups
 function M.formRaidFromLayout()
     local bots = getLayoutBotList()
-    if #bots == 0 then M.statusText = 'No bots in layout to invite.'; return end
+    if #bots == 0 then
+        M.statusText = 'No bots in layout to invite.'; return
+    end
     openRaidWindow(); raidUnlock()
     -- spawn and invite quickly
     for _, n in ipairs(bots) do
@@ -310,8 +328,8 @@ function M.formRaidFromLayout()
     -- arrange with retries to allow NotInGroup to populate (Raid must be LOCKED for move buttons to work)
     openRaidWindow(); raidLock()
     local totalAssigned = 0
-    for g=1,12 do
-        for s=1,6 do
+    for g = 1, 12 do
+        for s = 1, 6 do
             local name = M.desiredLayout[g][s]
             if name and name ~= '' then
                 local attempts = 0
@@ -352,14 +370,15 @@ function M.draw_tab()
 
     local availW = ImGui.GetWindowContentRegionWidth()
     local leftW = math.floor(availW * 0.33)
-    ImGui.BeginChild('RaidLeftPane', ImVec2(leftW, 0), true)
-        ImGui.Text('Select Groups:')
-        local groups = db.get_groups_with_members() or {}
-        for _, g in ipairs(groups) do
-            local checked = M.selectedGroupIds[g.id] and true or false
-            local newChecked = ImGui.Checkbox(string.format('%s (%d)', g.name or ('Group ' .. tostring(g.id)), (g.members and #g.members or 0)), checked)
-            M.selectedGroupIds[g.id] = newChecked or nil
-        end
+    ImGui.BeginChild('RaidLeftPane', ImVec2(leftW, 420), true)
+    ImGui.Text('Select Groups:')
+    local groups = db.get_groups_with_members() or {}
+    for _, g in ipairs(groups) do
+        local checked = M.selectedGroupIds[g.id] and true or false
+        local newChecked = ImGui.Checkbox(
+        string.format('%s (%d)', g.name or ('Group ' .. tostring(g.id)), (g.members and #g.members or 0)), checked)
+        M.selectedGroupIds[g.id] = newChecked or nil
+    end
 
     ImGui.Separator()
     ImGui.Text('All Bots:')
@@ -367,7 +386,7 @@ function M.draw_tab()
     if bot_inventory and bot_inventory.getAllBots then
         allBots = bot_inventory.getAllBots() or {}
     end
-    table.sort(allBots, function(a,b) return tostring(a):lower() < tostring(b):lower() end)
+    table.sort(allBots, function(a, b) return tostring(a):lower() < tostring(b):lower() end)
     if ImGui.BeginTable('AllBotsTable', 3, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
         ImGui.TableSetupColumn('Bot Name', ImGuiTableColumnFlags.WidthStretch)
         ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 120)
@@ -377,30 +396,53 @@ function M.draw_tab()
             ImGui.TableNextRow()
             ImGui.TableNextColumn(); ImGui.Text(tostring(name))
             ImGui.TableNextColumn();
-            local clsMeta = bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[name]
+            local clsMeta = bot_inventory and bot_inventory.bot_list_capture_set and
+            bot_inventory.bot_list_capture_set[name]
             local rawClass = clsMeta and clsMeta.Class or ''
             local up = tostring(rawClass or ''):upper()
             local fullMap = {
-                WAR='Warrior', WARRIOR='Warrior',
-                CLR='Cleric', CLERIC='Cleric',
-                PAL='Paladin', PALADIN='Paladin',
-                RNG='Ranger', RANGER='Ranger',
-                SHD='Shadow Knight', ['SHADOW KNIGHT']='Shadow Knight', SHADOWKNIGHT='Shadow Knight', SK='Shadow Knight',
-                DRU='Druid', DRUID='Druid',
-                MNK='Monk', MONK='Monk',
-                BRD='Bard', BARD='Bard',
-                ROG='Rogue', ROGUE='Rogue',
-                SHM='Shaman', SHAMAN='Shaman',
-                NEC='Necromancer', NECROMANCER='Necromancer',
-                WIZ='Wizard', WIZARD='Wizard',
-                MAG='Magician', MAGICIAN='Magician',
-                ENC='Enchanter', ENCHANTER='Enchanter',
-                BST='Beastlord', BEAST='Beastlord', BEASTLORD='Beastlord', BL='Beastlord',
-                BER='Berserker', BERSERKER='Berserker',
+                WAR = 'Warrior',
+                WARRIOR = 'Warrior',
+                CLR = 'Cleric',
+                CLERIC = 'Cleric',
+                PAL = 'Paladin',
+                PALADIN = 'Paladin',
+                RNG = 'Ranger',
+                RANGER = 'Ranger',
+                SHD = 'Shadow Knight',
+                ['SHADOW KNIGHT'] = 'Shadow Knight',
+                SHADOWKNIGHT = 'Shadow Knight',
+                SK = 'Shadow Knight',
+                DRU = 'Druid',
+                DRUID = 'Druid',
+                MNK = 'Monk',
+                MONK = 'Monk',
+                BRD = 'Bard',
+                BARD = 'Bard',
+                ROG = 'Rogue',
+                ROGUE = 'Rogue',
+                SHM = 'Shaman',
+                SHAMAN = 'Shaman',
+                NEC = 'Necromancer',
+                NECROMANCER = 'Necromancer',
+                WIZ = 'Wizard',
+                WIZARD = 'Wizard',
+                MAG = 'Magician',
+                MAGICIAN = 'Magician',
+                ENC = 'Enchanter',
+                ENCHANTER = 'Enchanter',
+                BST = 'Beastlord',
+                BEAST = 'Beastlord',
+                BEASTLORD = 'Beastlord',
+                BL = 'Beastlord',
+                BER = 'Berserker',
+                BERSERKER = 'Berserker',
             }
             local full = fullMap[up]
             if not full then
-                for key, val in pairs(fullMap) do if up:find(key) then full = val; break end end
+                for key, val in pairs(fullMap) do if up:find(key) then
+                        full = val; break
+                    end end
             end
             ImGui.Text(full or 'Unknown')
 
@@ -434,112 +476,127 @@ function M.draw_tab()
         ImGui.EndTable()
     end
 
-        if ImGui.Button('Invite Selected To Raid') then
-            if M._enqueue then M._enqueue(M.formRaidForSelected) else M.formRaidForSelected() end
-        end
+    if ImGui.Button('Invite Selected To Raid') then
+        if M._enqueue then M._enqueue(M.formRaidForSelected) else M.formRaidForSelected() end
+    end
     ImGui.EndChild()
 
     ImGui.SameLine()
 
     -- Right pane: raid grid
-    ImGui.BeginChild('RaidRightPane', ImVec2(0, 0), true)
-        ImGui.Text('Raid Layout')
-        ImGui.Separator()
+    ImGui.BeginChild('RaidRightPane', ImVec2(0, 420), true)
+    -- Save/Load controls
+    M._saveName = M._saveName or ''
+    M._saveName = select(1, ImGui.InputTextWithHint('##raidlayoutname', 'Add New Layout', M._saveName))
+    ImGui.SameLine()
+    if ImGui.SmallButton('Save') then M.save_current_layout(M._saveName) end
+    ImGui.SameLine()
+    if ImGui.SmallButton('Reload List') then M.load_saved_layouts() end
 
-        local cols = 4
-        if ImGui.BeginTable('RaidGrid', cols, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
-            for row = 0, 2 do
-                ImGui.TableNextRow()
-                for col = 1, cols do
-                    ImGui.TableNextColumn()
-                    local g = row * cols + col
-                    if g > 12 then break end
-                    ImGui.PushID('raid_group_' .. tostring(g))
-                    ImGui.Text(string.format('Group %d', g))
-                    if ImGui.BeginTable('G' .. tostring(g), 2, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.SizingFixedFit) then
-                        ImGui.TableSetupColumn('#', ImGuiTableColumnFlags.WidthFixed, 18)
-                        ImGui.TableSetupColumn('Member', ImGuiTableColumnFlags.WidthStretch)
-                        ImGui.TableHeadersRow()
-                        for slot = 1, 6 do
-                            ImGui.PushID(slot)
-                            ImGui.TableNextRow()
-                            ImGui.TableNextColumn(); ImGui.Text(tostring(slot))
-                            ImGui.TableNextColumn()
-                            local current = M.desiredLayout[g][slot]
-                            if current then
-                                if ImGui.SmallButton(current .. '##rm') then
-                                    -- remove: clear this slot (send back to bench)
-                                    M.desiredLayout[g][slot] = nil
-                                end
-                                if ImGui.IsItemHovered() then ImGui.SetTooltip('Click to remove to bench') end
-                            else
-                                -- choose from bench popup
-                                if ImGui.SmallButton('Add##add') then
-                                    ImGui.OpenPopup('pick')
-                                end
-                                if ImGui.BeginPopup('pick') then
-                                    local avail = unassignedAllBots()
-                                    if #avail == 0 then
-                                        ImGui.Text('No available bots. Refresh bot list?')
-                                    else
-                                        for _, n in ipairs(avail) do
-                                            if ImGui.MenuItem(n) then
-                                                M.desiredLayout[g][slot] = n
-                                                ImGui.CloseCurrentPopup()
-                                            end
+    local names = {}
+    for k, _ in pairs(M._savedLayouts or {}) do table.insert(names, k) end
+    table.sort(names)
+    if ImGui.BeginTable('SavedLayouts', 3, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+        ImGui.TableSetupColumn('Name', ImGuiTableColumnFlags.WidthStretch)
+        ImGui.TableSetupColumn('Load', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('Delete', ImGuiTableColumnFlags.WidthFixed, 70)
+        ImGui.TableHeadersRow()
+        for _, n in ipairs(names) do
+            ImGui.TableNextRow()
+            ImGui.TableNextColumn(); ImGui.Text(n)
+            ImGui.TableNextColumn(); if ImGui.SmallButton('Load##' .. n) then M.load_layout(n) end
+            ImGui.TableNextColumn(); if ImGui.SmallButton('Delete##' .. n) then M.delete_layout(n) end
+        end
+        ImGui.EndTable()
+    end
+
+    ImGui.Separator()
+    if ImGui.Button('Apply Layout To Raid') then
+        if M._enqueue then M._enqueue(M.applyLayout) else M.applyLayout() end
+    end
+    ImGui.SameLine()
+    if ImGui.Button('Form Raid (Invite + Arrange)') then
+        if M._enqueue then M._enqueue(M.formRaidFromLayout) else M.formRaidFromLayout() end
+    end
+        ImGui.SameLine()
+    ImGui.Text('# of Groups:')
+    ImGui.SameLine()
+    -- Dropdown (combo) 1-12 instead of slider (Combo is 1-based)
+    M._groupsOptions = M._groupsOptions or {'1','2','3','4','5','6','7','8','9','10','11','12'}
+    local currentIdx = M.groupsToDisplay or 12 -- 1-based
+    ImGui.PushItemWidth(60)
+    local newIdx, changed = ImGui.Combo('##RaidGroupsToDisplay', currentIdx, M._groupsOptions, #M._groupsOptions)
+    ImGui.PopItemWidth()
+    if changed and newIdx then
+        M.groupsToDisplay = math.max(1, math.min(12, newIdx))
+    end
+    ImGui.Text('Raid Layout')
+    ImGui.Separator()
+
+    local cols = 4
+    local totalGroups = math.max(1, math.min(12, M.groupsToDisplay or 12))
+    if ImGui.BeginTable('RaidGrid', cols, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+        local rows = math.ceil(totalGroups / cols)
+        for row = 0, rows-1 do
+            ImGui.TableNextRow()
+            for col = 1, cols do
+                ImGui.TableNextColumn()
+                local g = row * cols + col
+                if g > totalGroups then
+                    -- empty cell for alignment
+                    ImGui.Dummy(0, 0)
+                else
+                ImGui.PushID('raid_group_' .. tostring(g))
+                ImGui.Text(string.format('Group %d', g))
+                if ImGui.BeginTable('G' .. tostring(g), 2, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.SizingFixedFit) then
+                    ImGui.TableSetupColumn('#', ImGuiTableColumnFlags.WidthFixed, 18)
+                    ImGui.TableSetupColumn('Member', ImGuiTableColumnFlags.WidthStretch)
+                    ImGui.TableHeadersRow()
+                    for slot = 1, 6 do
+                        ImGui.PushID(slot)
+                        ImGui.TableNextRow()
+                        ImGui.TableNextColumn(); ImGui.Text(tostring(slot))
+                        ImGui.TableNextColumn()
+                        local current = M.desiredLayout[g][slot]
+                        if current then
+                            if ImGui.SmallButton(current .. '##rm') then
+                                -- remove: clear this slot (send back to bench)
+                                M.desiredLayout[g][slot] = nil
+                            end
+                            if ImGui.IsItemHovered() then ImGui.SetTooltip('Click to remove to bench') end
+                        else
+                            -- choose from bench popup
+                            if ImGui.SmallButton('Add##add') then
+                                ImGui.OpenPopup('pick')
+                            end
+                            if ImGui.BeginPopup('pick') then
+                                local avail = unassignedAllBots()
+                                if #avail == 0 then
+                                    ImGui.Text('No available bots. Refresh bot list?')
+                                else
+                                    for _, n in ipairs(avail) do
+                                        if ImGui.MenuItem(n) then
+                                            M.desiredLayout[g][slot] = n
+                                            ImGui.CloseCurrentPopup()
                                         end
                                     end
-                                    ImGui.EndPopup()
                                 end
+                                ImGui.EndPopup()
                             end
-                            ImGui.PopID()
                         end
-                        ImGui.EndTable()
+                        ImGui.PopID()
                     end
-                    if ImGui.SmallButton('Clear##grp' .. tostring(g)) then M.desiredLayout[g] = {} end
-                    ImGui.PopID()
+                    ImGui.EndTable()
+                end
+                if ImGui.SmallButton('Clear##grp' .. tostring(g)) then M.desiredLayout[g] = {} end
+                ImGui.PopID()
                 end
             end
-            ImGui.EndTable()
         end
+        ImGui.EndTable()
+    end
 
-        ImGui.Separator()
-        ImGui.Separator()
-        -- Save/Load controls
-        ImGui.Text('Layouts:')
-        ImGui.SameLine()
-        M._saveName = M._saveName or ''
-        M._saveName = ImGui.InputText('##raidlayoutname', M._saveName)
-        ImGui.SameLine()
-        if ImGui.SmallButton('Save') then M.save_current_layout(M._saveName) end
-        ImGui.SameLine()
-        if ImGui.SmallButton('Reload List') then M.load_saved_layouts() end
-
-        local names = {}
-        for k,_ in pairs(M._savedLayouts or {}) do table.insert(names, k) end
-        table.sort(names)
-        if ImGui.BeginTable('SavedLayouts', 3, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
-            ImGui.TableSetupColumn('Name', ImGuiTableColumnFlags.WidthStretch)
-            ImGui.TableSetupColumn('Load', ImGuiTableColumnFlags.WidthFixed, 60)
-            ImGui.TableSetupColumn('Delete', ImGuiTableColumnFlags.WidthFixed, 70)
-            ImGui.TableHeadersRow()
-            for _,n in ipairs(names) do
-                ImGui.TableNextRow()
-                ImGui.TableNextColumn(); ImGui.Text(n)
-                ImGui.TableNextColumn(); if ImGui.SmallButton('Load##'..n) then M.load_layout(n) end
-                ImGui.TableNextColumn(); if ImGui.SmallButton('Delete##'..n) then M.delete_layout(n) end
-            end
-            ImGui.EndTable()
-        end
-
-        ImGui.Separator()
-        if ImGui.Button('Apply Layout To Raid') then
-            if M._enqueue then M._enqueue(M.applyLayout) else M.applyLayout() end
-        end
-        ImGui.SameLine()
-        if ImGui.Button('Form Raid (Invite + Arrange)') then
-            if M._enqueue then M._enqueue(M.formRaidFromLayout) else M.formRaidFromLayout() end
-        end
+    ImGui.Separator()
     ImGui.EndChild()
 end
 

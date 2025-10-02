@@ -243,28 +243,35 @@ end
 get_cursor_stats = function()
     local cur = mq.TLO.Cursor
     if not cur or not cur() then return 0, 0, 0 end
-    local ac = tonumber(cur.AC() or 0) or 0
-    local hp = tonumber(cur.HP() or 0) or 0
-    local mana = tonumber(cur.Mana() or 0) or 0
-    -- Fallbacks where available (DisplayItem -> Item totals) to reduce 0 stats
-    if (ac == 0 or hp == 0 or mana == 0) and mq.TLO.DisplayItem and mq.TLO.DisplayItem()
-        and mq.TLO.DisplayItem.Item and mq.TLO.DisplayItem.Item() then
+
+    -- Prefer DisplayItem.Item stats (base values), then fall back to cursor (often shows totals)
+    local di_ac, di_hp, di_mana = 0, 0, 0
+    if mq.TLO.DisplayItem and mq.TLO.DisplayItem() and mq.TLO.DisplayItem.Item and mq.TLO.DisplayItem.Item() then
         local di = mq.TLO.DisplayItem.Item
         local function safe_num(getter)
             if not getter then return 0 end
             local ok, v = pcall(function() return tonumber(getter()) or 0 end)
             return ok and v or 0
         end
-        if ac == 0 then
-            ac = safe_num(di.AC)
-            if ac == 0 and di.TotalAC then ac = safe_num(di.TotalAC) end
-        end
-        if hp == 0 then
-            hp = safe_num(di.HP)
-            if hp == 0 and di.HitPoints then hp = safe_num(di.HitPoints) end
-        end
-        if mana == 0 then mana = safe_num(di.Mana) end
+        -- AC: use AC if available; otherwise TotalAC
+        di_ac = safe_num(di.AC)
+        if di_ac == 0 and di.TotalAC then di_ac = safe_num(di.TotalAC) end
+        -- HP: some builds expose HitPoints instead of HP
+        di_hp = safe_num(di.HP)
+        if di_hp == 0 and di.HitPoints then di_hp = safe_num(di.HitPoints) end
+        -- Mana
+        di_mana = safe_num(di.Mana)
     end
+
+    local cur_ac = tonumber(cur.AC() or 0) or 0
+    local cur_hp = tonumber(cur.HP() or 0) or 0
+    local cur_mana = tonumber(cur.Mana() or 0) or 0
+
+    -- Choose display-item values when present (>0), otherwise cursor totals
+    local ac = (di_ac and di_ac > 0) and di_ac or cur_ac
+    local hp = (di_hp and di_hp > 0) and di_hp or cur_hp
+    local mana = (di_mana and di_mana > 0) and di_mana or cur_mana
+
     return ac, hp, mana
 end
 
@@ -447,12 +454,10 @@ function U.draw_compare_window()
         return
     end
 
-    -- Gather upgrade stats from cursor
+    -- Gather upgrade stats from cursor (prefer DisplayItem base stats via get_cursor_stats)
     local cur = mq.TLO.Cursor
     local upgName = cur() and (cur.Name() or 'Upgrade Item') or 'Upgrade Item'
-    local upgAC = cur() and tonumber(cur.AC() or 0) or 0
-    local upgHP = cur() and tonumber(cur.HP() or 0) or 0
-    local upgMana = cur() and tonumber(cur.Mana() or 0) or 0
+    local upgAC, upgHP, upgMana = get_cursor_stats()
 
     ImGui.Text('Upgrade Item: ' .. tostring(upgName))
     ImGui.SameLine()
