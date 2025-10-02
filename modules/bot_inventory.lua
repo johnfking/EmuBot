@@ -788,6 +788,66 @@ function BotInventory.getBotInventory(botName)
     return BotInventory.bot_inventories[botName]
 end
 
+-- Apply a known equipped item change using the cursor item data (no ^invlist roundtrip)
+-- Replaces the equipped item in the given slot and persists to SQLite immediately.
+-- Parameters:
+--  botName   - target bot name
+--  slotID    - numeric slot id
+--  slotName  - human readable slot name
+--  itemID    - numeric itemID of the cursor item
+--  itemName  - name of the cursor item
+--  ac,hp,mana,icon (numbers) - optional stats/icon to set; nil treated as 0
+function BotInventory.applySwapFromCursor(botName, slotID, slotName, itemID, itemName, ac, hp, mana, icon)
+    if not botName or slotID == nil then return false, 'bad args' end
+
+    -- Ensure bot cache exists
+    BotInventory.bot_inventories[botName] = BotInventory.bot_inventories[botName] or {
+        name = botName,
+        equipped = {},
+        bags = {},
+        bank = {},
+    }
+
+    local eq = BotInventory.bot_inventories[botName].equipped
+
+    local newItem = {
+        name = itemName or 'Item',
+        slotid = tonumber(slotID),
+        slotname = slotName or tostring(slotID),
+        itemlink = nil,
+        rawline = nil,
+        itemID = tonumber(itemID) or 0,
+        icon = tonumber(icon or 0) or 0,
+        ac = tonumber(ac or 0) or 0,
+        hp = tonumber(hp or 0) or 0,
+        mana = tonumber(mana or 0) or 0,
+        qty = 1,
+        nodrop = 1,
+    }
+
+    -- Replace existing slot entry or insert
+    local replaced = false
+    for i = 1, #eq do
+        local it = eq[i]
+        if tonumber(it.slotid) == tonumber(slotID) then
+            eq[i] = newItem
+            replaced = true
+            break
+        end
+    end
+    if not replaced then table.insert(eq, newItem) end
+
+    -- Persist to DB with available bot meta
+    local meta = BotInventory.bot_list_capture_set and BotInventory.bot_list_capture_set[botName] or nil
+    local ok, err = db.save_bot_inventory(botName, BotInventory.bot_inventories[botName], meta)
+    if not ok then
+        print(string.format('[BotInventory][DB] Failed to persist swap for %s: %s', botName, tostring(err)))
+        return false, err
+    end
+
+    return true
+end
+
 -- Compare items and detect mismatches that need re-scanning
 function BotInventory.compareInventoryData(botName, oldData, newData)
     if not oldData or not newData then return {} end

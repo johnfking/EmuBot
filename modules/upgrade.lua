@@ -8,6 +8,10 @@ local U = {}
 
 U._candidates = {}
 U._show_compare = false
+U._pending_refresh = {}
+
+-- Forward declaration so functions defined earlier can call it safely
+local get_cursor_stats
 
 local function printf(fmt, ...)
     if mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end
@@ -110,6 +114,29 @@ local function add_candidate(c)
     U._candidates[#U._candidates + 1] = c
 end
 
+-- Queue a timed inventory refresh for a bot (non-blocking); retries spaced by delaySec
+function U.queue_refresh(botName, delaySec, retries)
+    if not botName or botName == '' then return end
+    U._pending_refresh[botName] = U._pending_refresh[botName] or { nextAt = 0, left = 0, delay = delaySec or 0.8 }
+    local entry = U._pending_refresh[botName]
+    entry.left = math.max(tonumber(retries or 1) or 1, entry.left)
+    entry.delay = tonumber(delaySec or entry.delay or 0.8) or 0.8
+    entry.nextAt = os.clock() + entry.delay
+end
+
+local function process_pending_refreshes()
+    if not bot_inventory or not bot_inventory.requestBotInventory then return end
+    local now = os.clock()
+    for name, entry in pairs(U._pending_refresh) do
+        if entry and (entry.left or 0) > 0 and now >= (entry.nextAt or 0) then
+            bot_inventory.requestBotInventory(name)
+            entry.left = (entry.left or 1) - 1
+            entry.nextAt = now + (entry.delay or 0.8)
+            if entry.left <= 0 then U._pending_refresh[name] = nil end
+        end
+    end
+end
+
 local function compute_local_candidates_from_cursor()
     clear_candidates()
     local cur = mq.TLO.Cursor
@@ -167,7 +194,7 @@ local function ensure_item_on_cursor(itemID)
     return mq.TLO.Cursor() and tonumber(mq.TLO.Cursor.ID() or 0) == itemID
 end
 
-local function swap_to_bot(botName, itemID)
+local function swap_to_bot(botName, itemID, slotID, slotName)
     -- UI enforces that the cursor already holds the correct item before enabling Swap.
     -- So we avoid any blocking/delay here.
     if not mq.TLO.Cursor() or tonumber(mq.TLO.Cursor.ID() or 0) ~= tonumber(itemID or 0) then
@@ -175,9 +202,18 @@ local function swap_to_bot(botName, itemID)
         return false
     end
     mq.cmdf('/say ^ig byname %s', botName)
-    -- Non-blocking: ask for a refresh, let background pipeline update the cache
-    if bot_inventory and bot_inventory.requestBotInventory then
-        bot_inventory.requestBotInventory(botName)
+
+    -- Optimistically update cache/DB using cursor data to avoid ^invlist roundtrip
+    local ac, hp, mana = get_cursor_stats()
+    local icon = 0
+    local ok_icon, icon_val = pcall(function()
+        if mq.TLO.Cursor.Icon then return tonumber(mq.TLO.Cursor.Icon() or 0) or 0 end
+        return 0
+    end)
+    if ok_icon and icon_val then icon = icon_val end
+    if bot_inventory and bot_inventory.applySwapFromCursor and slotID ~= nil then
+        bot_inventory.applySwapFromCursor(botName, slotID, slotName, tonumber(itemID) or 0,
+            mq.TLO.Cursor.Name() or 'Item', ac, hp, mana, icon)
     end
     return true
 end
@@ -203,7 +239,37 @@ function U.clear()
     clear_candidates()
 end
 
+-- Helper to read cursor item basic stats safely
+get_cursor_stats = function()
+    local cur = mq.TLO.Cursor
+    if not cur or not cur() then return 0, 0, 0 end
+    local ac = tonumber(cur.AC() or 0) or 0
+    local hp = tonumber(cur.HP() or 0) or 0
+    local mana = tonumber(cur.Mana() or 0) or 0
+    -- Fallbacks where available (DisplayItem -> Item totals) to reduce 0 stats
+    if (ac == 0 or hp == 0 or mana == 0) and mq.TLO.DisplayItem and mq.TLO.DisplayItem()
+        and mq.TLO.DisplayItem.Item and mq.TLO.DisplayItem.Item() then
+        local di = mq.TLO.DisplayItem.Item
+        local function safe_num(getter)
+            if not getter then return 0 end
+            local ok, v = pcall(function() return tonumber(getter()) or 0 end)
+            return ok and v or 0
+        end
+        if ac == 0 then
+            ac = safe_num(di.AC)
+            if ac == 0 and di.TotalAC then ac = safe_num(di.TotalAC) end
+        end
+        if hp == 0 then
+            hp = safe_num(di.HP)
+            if hp == 0 and di.HitPoints then hp = safe_num(di.HitPoints) end
+        end
+        if mana == 0 then mana = safe_num(di.Mana) end
+    end
+    return ac, hp, mana
+end
+
 function U.draw_tab()
+    process_pending_refreshes()
     ImGui.Text('Cursor Item:')
     if mq.TLO.Cursor() then
         ImGui.SameLine()
@@ -230,11 +296,14 @@ function U.draw_tab()
         return
     end
 
-    if ImGui.BeginTable('EmuBotUpgradeTable', 5, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+    if ImGui.BeginTable('EmuBotUpgradeTable', 8, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
         ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
+        ImGui.TableSetupColumn('Δ AC', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('Δ HP', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('Δ Mana', ImGuiTableColumnFlags.WidthFixed, 70)
         ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableHeadersRow()
 
@@ -270,9 +339,32 @@ function U.draw_tab()
             ImGui.TableNextColumn()
             ImGui.Text(row.itemName or 'Upgrade Item')
 
+            -- Compute deltas for quick glance in the main table
+            local upgAC, upgHP, upgMana = get_cursor_stats()
+            local cAC, cHP, cMana = 0, 0, 0
+            if bot_inventory and bot_inventory.getBotEquippedItem and row.bot and row.slotid ~= nil then
+                local curItem = bot_inventory.getBotEquippedItem(row.bot, row.slotid)
+                cAC = tonumber(curItem and curItem.ac or 0) or 0
+                cHP = tonumber(curItem and curItem.hp or 0) or 0
+                cMana = tonumber(curItem and curItem.mana or 0) or 0
+            end
+            local dAC = (upgAC or 0) - cAC
+            local dHP = (upgHP or 0) - cHP
+            local dMana = (upgMana or 0) - cMana
+
+            local function colortext(delta)
+                if delta > 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, '+' .. tostring(delta))
+                elseif delta < 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(delta))
+                else ImGui.Text('0') end
+            end
+
+            ImGui.TableNextColumn(); colortext(dAC)
+            ImGui.TableNextColumn(); colortext(dHP)
+            ImGui.TableNextColumn(); colortext(dMana)
+
             ImGui.TableNextColumn()
             if ImGui.SmallButton('Swap') then
-                local ok = swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0)
+                local ok = swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0, row.slotid, row.slotname)
                 if ok then
                     -- Remove this candidate (assumes single item usage)
                     table.remove(U._candidates, i)
@@ -346,6 +438,7 @@ end
 -- Draw a comparison window showing current equipped vs upgrade stats (AC/HP/Mana), with quick swap per row
 function U.draw_compare_window()
     if not U._show_compare then return end
+    process_pending_refreshes()
     local wndFlags = ImGuiWindowFlags.None
     local isOpen, visible = ImGui.Begin('Upgrade Comparison##EmuBot', true, wndFlags)
     if not isOpen then
@@ -450,7 +543,7 @@ function U.draw_compare_window()
             local canSwap = mq.TLO.Cursor() and (tonumber(mq.TLO.Cursor.ID() or 0) == tonumber(row.itemID or 0))
             if not canSwap then ImGui.BeginDisabled(true) end
             if ImGui.SmallButton('Swap##cmp' .. tostring(i)) then
-                if swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0) then
+                if swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0, row.slotid, row.slotname) then
                     table.remove(U._candidates, i)
                 end
             end

@@ -7,6 +7,7 @@ local bot_groups = require('EmuBot.modules.bot_groups')
 local raid_manager = require('EmuBot.modules.raid_manager')
 local upgrade = require('EmuBot.modules.upgrade')
 local db = require('EmuBot.modules.db')
+local commandsui = require('EmuBot.ui.commandsui')
 
 -- EmuBot UI style helpers: round all relevant UI elements at radius 8
 local function EmuBot_PushRounding()
@@ -2386,6 +2387,23 @@ EmuBot_PushRounding()
             botUI.selectedBot = nil
         end
 
+        -- Toggle HotBar button
+        ImGui.SameLine()
+        local hb_on = commandsui and commandsui.is_visible and commandsui.is_visible() or false
+        if hb_on then
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.6, 0.2, 0.9)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.25, 0.7, 0.25, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.15, 0.5, 0.15, 1.0)
+        else
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.4, 0.4, 0.4, 0.9)
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.5, 0.5, 0.5, 1.0)
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.35, 0.35, 0.35, 1.0)
+        end
+        if ImGui.Button('HotBar') then
+            if commandsui and commandsui.toggle then commandsui.toggle() end
+        end
+        ImGui.PopStyleColor(3)
+
         ImGui.SameLine()
         ImGui.Text('Viewing bot:')
         ImGui.SameLine()
@@ -2434,7 +2452,7 @@ EmuBot_PushRounding()
             ImGui.Text(comboLabel)
         end
 
-        local buttonWidth = 140
+        local buttonWidth = 80
         local buttonSpacing = ImGui.GetStyle().ItemSpacing.x
         local buttonCount = 3
         local totalButtonWidth = buttonWidth * buttonCount + buttonSpacing * (buttonCount - 1)
@@ -2442,7 +2460,7 @@ EmuBot_PushRounding()
         ImGui.SameLine()
         ImGui.SetCursorPosX(math.max(0, windowWidth - totalButtonWidth - 10))
 
-        if ImGui.Button('Refresh Inventory', buttonWidth, 0) then
+        if ImGui.Button('Refresh', buttonWidth, 0) then
             if botUI.selectedBot and botUI.selectedBot.name then
                 bot_inventory.requestBotInventory(botUI.selectedBot.name)
                 printf('Refreshing inventory for bot: %s', botUI.selectedBot.name)
@@ -2454,7 +2472,7 @@ EmuBot_PushRounding()
 
         ImGui.SameLine()
 
-        if ImGui.Button('Scan Selected Bot', buttonWidth, 0) then
+        if ImGui.Button('Scan Bot', buttonWidth, 0) then
             local itemsToScan = {}
 for _, it in ipairs(equippedItems or {}) do
                 local missing = (not it.ac and not it.hp and not it.mana)
@@ -2472,7 +2490,7 @@ for _, it in ipairs(equippedItems or {}) do
 
         ImGui.SameLine()
 
-if ImGui.Button('Close Window', buttonWidth, 0) then
+if ImGui.Button('Close', buttonWidth, 0) then
             botUI.showWindow = false
             botUI.selectedBot = nil
             botUI.selectedBotSlotID = nil
@@ -2484,50 +2502,12 @@ if ImGui.Button('Close Window', buttonWidth, 0) then
         
         ImGui.Separator()
 
-        -- Export buttons
-        ImGui.Text('Export Data:')
-        ImGui.SameLine()
-
-        if ImGui.Button('Export JSON', buttonWidth, 0) then
-            if bot_inventory and bot_inventory.exportBotInventories then
-                local ok, result = bot_inventory.exportBotInventories('json')
-                if ok then
-                    botUI.lastExportWasSuccess = true
-                    botUI.lastExportMessage = string.format('Exported JSON to %s', tostring(result))
-                    printf('[EmuBot] Exported JSON inventory snapshot to %s', tostring(result))
-                else
-                    botUI.lastExportWasSuccess = false
-                    botUI.lastExportMessage = string.format('Export failed: %s', tostring(result))
-                    printf('[EmuBot] Export to JSON failed: %s', tostring(result))
-                end
-            end
-        end
-
-        ImGui.SameLine()
-
-        if ImGui.Button('Export CSV', buttonWidth, 0) then
-            if bot_inventory and bot_inventory.exportBotInventories then
-                local ok, result = bot_inventory.exportBotInventories('csv')
-                if ok then
-                    botUI.lastExportWasSuccess = true
-                    botUI.lastExportMessage = string.format('Exported CSV to %s', tostring(result))
-                    printf('[EmuBot] Exported CSV inventory snapshot to %s', tostring(result))
-                else
-                    botUI.lastExportWasSuccess = false
-                    botUI.lastExportMessage = string.format('Export failed: %s', tostring(result))
-                    printf('[EmuBot] Export to CSV failed: %s', tostring(result))
-                end
-            end
-        end
-
-        ImGui.SameLine()
-
         -- Scan All Bots section
         ImGui.Text('Bulk Operations:')
         ImGui.SameLine()
         
         if not botUI._scanAllActive then
-            if ImGui.Button('Scan All Bots', buttonWidth, 0) then
+            if ImGui.Button('Scan All', buttonWidth, 0) then
                 botUI.startScanAllBots()
             end
             if ImGui.IsItemHovered() then
@@ -2563,7 +2543,7 @@ if ImGui.Button('Close Window', buttonWidth, 0) then
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.3, 0.8, 0.3, 0.9)
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.1, 0.6, 0.1, 1.0)
             ImGui.PushStyleColor(ImGuiCol.Text, 1.0, 1.0, 1.0, 1.0)
-            if ImGui.Button(' ON ') then
+            if ImGui.Button(' NO ') then
                 botUI.disableCampDuringScanAll = false
             end
         else
@@ -2572,7 +2552,7 @@ if ImGui.Button('Close Window', buttonWidth, 0) then
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 0.9)
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.6, 0.1, 0.1, 1.0)
             ImGui.PushStyleColor(ImGuiCol.Text, 1.0, 1.0, 1.0, 1.0)
-            if ImGui.Button('OFF') then
+            if ImGui.Button('YES') then
                 botUI.disableCampDuringScanAll = true
             end
         end
@@ -2651,15 +2631,6 @@ if ImGui.Button('Close Window', buttonWidth, 0) then
             ImGui.TextColored(0.2, 0.8, 0.2, 1.0, string.format('(%d items auto-scanned)', botUI._autoScannedItems))
         end
 
-        if botUI.lastExportMessage then
-            local message = botUI.lastExportMessage
-            if botUI.lastExportWasSuccess then
-                ImGui.Text(message)
-            else
-                ImGui.TextWrapped(message)
-            end
-        end
-
         ImGui.Separator()
 
 if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
@@ -2698,7 +2669,7 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                 ImGui.EndTabItem()
             end
 
-            if ImGui.BeginTabItem('Settings') then
+            if ImGui.BeginTabItem('Settings/Utils') then
                 local res1, res2 = ImGui.SliderFloat('Fetch Interval (sec)##BotFetchDelay', botUI.botFetchDelay, 0.1, 5.0, '%.1f')
                 if type(res1) == 'boolean' then
                     if res1 then
@@ -2828,6 +2799,48 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                     end
                 else
                     ImGui.Text('No bots currently skipped')
+                end
+
+                -- Utils: Export Data
+                ImGui.Separator()
+                ImGui.Text('Export Data')
+                ImGui.SameLine()
+                if ImGui.Button('Export JSON') then
+                    if bot_inventory and bot_inventory.exportBotInventories then
+                        local ok, result = bot_inventory.exportBotInventories('json')
+                        if ok then
+                            botUI.lastExportWasSuccess = true
+                            botUI.lastExportMessage = string.format('Exported JSON to %s', tostring(result))
+                            printf('[EmuBot] Exported JSON inventory snapshot to %s', tostring(result))
+                        else
+                            botUI.lastExportWasSuccess = false
+                            botUI.lastExportMessage = string.format('Export failed: %s', tostring(result))
+                            printf('[EmuBot] Export to JSON failed: %s', tostring(result))
+                        end
+                    end
+                end
+                ImGui.SameLine()
+                if ImGui.Button('Export CSV') then
+                    if bot_inventory and bot_inventory.exportBotInventories then
+                        local ok, result = bot_inventory.exportBotInventories('csv')
+                        if ok then
+                            botUI.lastExportWasSuccess = true
+                            botUI.lastExportMessage = string.format('Exported CSV to %s', tostring(result))
+                            printf('[EmuBot] Exported CSV inventory snapshot to %s', tostring(result))
+                        else
+                            botUI.lastExportWasSuccess = false
+                            botUI.lastExportMessage = string.format('Export failed: %s', tostring(result))
+                            printf('[EmuBot] Export to CSV failed: %s', tostring(result))
+                        end
+                    end
+                end
+                if botUI.lastExportMessage then
+                    local message = botUI.lastExportMessage
+                    if botUI.lastExportWasSuccess then
+                        ImGui.Text(message)
+                    else
+                        ImGui.TextWrapped(message)
+                    end
                 end
 
                 ImGui.EndTabItem()
@@ -3137,6 +3150,9 @@ local function main()
     if raid_manager and raid_manager.set_enqueue then raid_manager.set_enqueue(enqueueTask) end
     if raid_manager and raid_manager.init then raid_manager.init() end
     if upgrade and upgrade.init then upgrade.init() end
+
+    -- Start the Bot HotBar floating UI
+    if commandsui and commandsui.start then commandsui.start() end
 
     mq.imgui.init('EmuBot', function()
         botUI.render()

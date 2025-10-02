@@ -153,8 +153,17 @@ function M.draw()
 
     local bots = bot_inventory.getAllBots() or {}
     if #bots == 0 then
-        ImGui.Text('No bots found. Click "Refresh Bot List" to capture bots.')
-        return
+        ImGui.Text('No bots found. Click "Refresh Bot List" to capture bots, or create one below.')
+        -- Do not return here if create dialog is open
+        if not M.showCreateDialog then
+            -- Still allow opening the create dialog even when list is empty
+            -- Show a hint button to open the dialog
+            if ImGui.Button('Create New Bot##empty') then
+                M.showCreateDialog = true
+            end
+            -- Without an open dialog, we can early-out
+            return
+        end
     end
 
     if ImGui.BeginTable('BotManagementTable', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
