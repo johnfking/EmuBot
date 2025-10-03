@@ -1,6 +1,7 @@
-Finally! A visual tool to help you keep track of your ^bot inventories.  
+Finally! A visual tool to help you keep track of your ^bots and their inventories.  
 
-Drop this in your /lua folder, then run in game with a /lua run emubot.  
+Drop this in your /lua folder, then run in game with a /lua run emubot.  ***NOTE***  If the folder has -main on it, you will need to rename the folder and delete -main off the end.  
+Your file structure should look like <macroquest>/lua/emubot/init.lua.  It should NOT look like <macroquest>/lua/emubot/emubot/init.lua
 
 ![emubot 1](https://github.com/user-attachments/assets/a926e47f-205a-4d14-b0be-43ae7d532300)
 
