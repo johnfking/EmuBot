@@ -86,14 +86,16 @@ local botUI = {
     localCompareItems = {},
     rightClickedBotItem = nil,
     -- Bot failure tracking
-    _botFailureCount = {},
+    _botFailureCount = {}, -- Track failed bots with attempt count
     _maxFailures = 3, -- Max attempts before skipping a bot
     _failureTimeout = 300, -- 5 minutes before allowing retry of failed bot
     _skippedBots = {}, -- Track skipped bots with timestamp
     -- Camp control during scan all
     disableCampDuringScanAll = false, -- When true, don't camp bots during scan all
+    -- Camp control during scan all
+    _originalCampSetting = false, -- Track original camp setting
     -- Auto-scan tracking
-    _autoScannedItems = 0, -- Track items auto-scanned due to mismatches
+    _autoScannedItems = 0, -- Track items auto-scanned due to mismatches,
 }
 
 local function drawItemIcon(iconID, width, height)
@@ -110,6 +112,9 @@ end
 local function enqueueTask(fn)
     table.insert(botUI.deferred_tasks, fn)
 end
+
+-- Expose enqueueTask so other modules can schedule non-blocking actions
+_G.enqueueTask = enqueueTask
 
 local function processDeferredTasks()
     if #botUI.deferred_tasks == 0 then return end
@@ -235,12 +240,31 @@ local function populateStatsFromDisplayItem(target)
     end
 
     local mana = getDisplayItemNumber(item.Mana)
+    -- Prefer top-level DisplayItem fields for weapon stats, then fallback to Item.*
+    local damage = 0
+    local delay = 0
+    local okDmg, topDamage = pcall(function() return tonumber(displayItem.Damage and displayItem.Damage() or 0) or 0 end)
+    local okDly, topDelay = pcall(function() return tonumber(displayItem.ItemDelay and displayItem.ItemDelay() or 0) or 0 end)
+    if okDmg and topDamage and topDamage > 0 then damage = topDamage else damage = getDisplayItemNumber(item.Damage) end
+    if okDly and topDelay and topDelay > 0 then delay = topDelay else delay = getDisplayItemNumber(item.ItemDelay) end
 
     target.ac = ac
     target.hp = hp
     target.mana = mana
+    target.damage = damage
+    target.delay = delay
 
-    local hasNonZero = (ac ~= 0) or (hp ~= 0) or (mana ~= 0)
+    -- Optional debug: show what DisplayItem reported for weapon stats
+    if db and db._debug then
+        printf('[EmuBot][ScanDI] %s: DisplayItem Damage=%d Delay=%d | Item.Damage=%d Item.Delay=%d',
+            tostring(target.name or target.slotname or 'item'),
+            tonumber(topDamage or 0) or 0,
+            tonumber(topDelay or 0) or 0,
+            tonumber(getDisplayItemNumber(item.Damage) or 0) or 0,
+            tonumber(getDisplayItemNumber(item.ItemDelay) or 0) or 0)
+    end
+
+    local hasNonZero = (ac ~= 0) or (hp ~= 0) or (mana ~= 0) or (damage ~= 0) or (delay ~= 0)
     return true, hasNonZero
 end
 
@@ -422,6 +446,66 @@ function botUI.startScanAllBots()
     enqueueTask(botUI._processScanAllBots)
 end
 
+-- Begin a scan-all session using the current bot list
+function botUI._beginScanAll(campDisabled)
+    local botList, _ = collectBotNames()
+    if #botList == 0 then
+        printf('[EmuBot] No bots found to scan!')
+        return true
+    end
+
+    botUI._scanAllActive = true
+    botUI._scanAllQueue = {}
+    for _, botName in ipairs(botList) do
+        table.insert(botUI._scanAllQueue, botName)
+    end
+    botUI._scanAllBotIndex = 0
+    botUI._scanAllCurrentBot = nil
+    botUI._scanAllTotalItems = 0
+    botUI._scanAllStartTime = os.time()
+    botUI._scanAllProgress = string.format('Starting scan of %d bots...', #botList)
+
+    botUI.disableCampDuringScanAll = campDisabled and true or false
+    if botUI.disableCampDuringScanAll then
+        printf('[EmuBot] Starting scan of all %d bots... (camping disabled)', #botList)
+    else
+        printf('[EmuBot] Starting scan of all %d bots...', #botList)
+    end
+
+    enqueueTask(botUI._processScanAllBots)
+    return true
+end
+
+-- Refresh bot list and then start scan-all once list is ready (or after a short timeout)
+function botUI._startScanAllAfterRefresh(campDisabled)
+    if bot_inventory and bot_inventory.refreshBotList then
+        bot_inventory.refreshBotList()
+    end
+    local attempts = 0
+    local function poll()
+        attempts = attempts + 1
+        if bot_inventory and bot_inventory.refreshing_bot_list then
+            if attempts < 20 then
+                enqueueTask(function() mq.delay(250); botUI._startScanAllAfterRefresh_step(campDisabled, attempts) end)
+                return true
+            end
+        end
+        botUI._beginScanAll(campDisabled)
+        return true
+    end
+    -- Helper to avoid upvalues being lost in nested enqueueTask closures
+    function botUI._startScanAllAfterRefresh_step(campDisabledInner, attemptNum)
+        if bot_inventory and bot_inventory.refreshing_bot_list and attemptNum < 20 then
+            enqueueTask(function() mq.delay(250); botUI._startScanAllAfterRefresh_step(campDisabledInner, attemptNum + 1) end)
+            return true
+        end
+        botUI._beginScanAll(campDisabledInner)
+        return true
+    end
+    enqueueTask(poll)
+    return true
+end
+
 function botUI.stopScanAllBots()
     if not botUI._scanAllActive then return end
     
@@ -509,6 +593,10 @@ function botUI._processScanAllBots()
         if itemQueueSize > 0 then
             printf('[EmuBot] %d items are still being scanned in the background...', itemQueueSize)
         end
+        
+        -- Restore original camp setting after scan is complete
+        botUI.disableCampDuringScanAll = botUI._originalCampSetting
+        
         return true
     end
     
@@ -607,6 +695,16 @@ function botUI._completeScanAllBotStep(botName, shouldCamp)
             -- Check if item needs scanning (missing stats or has zero stats)
             local needsScanning = (not item.ac and not item.hp and not item.mana)
                 or ((tonumber(item.ac or 0) == 0) and (tonumber(item.hp or 0) == 0) and (tonumber(item.mana or 0) == 0))
+
+            -- If this is a likely weapon slot, also scan when damage/delay are missing
+            local sid = tonumber(item.slotid or -1) or -1
+            if sid == 11 or sid == 13 or sid == 14 then
+                local dmgZero = (tonumber(item.damage or 0) == 0)
+                local dlyZero = (tonumber(item.delay or 0) == 0)
+                if dmgZero or dlyZero then
+                    needsScanning = true
+                end
+            end
             
             if needsScanning and item.itemlink and item.itemlink ~= '' then
                 table.insert(itemsToScan, item)
@@ -785,10 +883,52 @@ local entry = table.remove(botUI._scanQueue, 1)
     current.ac = 0
     current.hp = 0
     current.mana = 0
+    current.damage = 0
+    current.delay = 0
     local links = mq.ExtractLinks(current.itemlink or '')
-    if not links or #links == 0 then
-        enqueueTask(botUI._processNextScan)
-        return true
+    -- If no link stored for this item, refresh ^invlist for the owning bot to capture links from chat, then retry
+    if (not links or #links == 0) then
+        if currentBot and bot_inventory and bot_inventory.requestBotInventory then
+            local retries = 0
+            local maxRetries = 3
+            local function fetchLinksFromBot()
+                retries = retries + 1
+                bot_inventory.requestBotInventory(currentBot)
+                mq.delay(700)
+                local updated = bot_inventory.getBotInventory and bot_inventory.getBotInventory(currentBot)
+                if updated and updated.equipped then
+                    local found
+                    for _, it in ipairs(updated.equipped) do
+                        if tonumber(it.slotid or -1) == tonumber(current.slotid or -2) then
+                            found = it
+                            break
+                        end
+                    end
+                    if found and found.itemlink and found.itemlink ~= '' then
+                        current.itemlink = found.itemlink
+                        local l = mq.ExtractLinks(current.itemlink or '')
+                        if l and #l > 0 then
+                            links = l
+                            -- Proceed with this same scan now that we have links
+                            enqueueTask(botUI._processNextScan)
+                            return true
+                        end
+                    end
+                end
+                if retries < maxRetries then
+                    enqueueTask(fetchLinksFromBot)
+                else
+                    -- Give up on this item; move on
+                    enqueueTask(botUI._processNextScan)
+                end
+                return true
+            end
+            enqueueTask(fetchLinksFromBot)
+            return true
+        else
+            enqueueTask(botUI._processNextScan)
+            return true
+        end
     end
     local link = links[1]
     local wnd = mq.TLO.Window('ItemDisplayWindow')
@@ -807,13 +947,16 @@ local entry = table.remove(botUI._scanQueue, 1)
         local augCaptured = captureAugmentData(current)
         local statsCaptured, hasNonZero = populateStatsFromDisplayItem(current)
 
+        -- Do not supplement from Item TLO here; rely on DisplayItem for scan results
+
         return statsCaptured, hasIcon, augCaptured, hasNonZero
     end
 
     local function poll()
         attempts = attempts + 1
         local statsCaptured, hasIcon, augCaptured, hasNonZero = tryRead()
-if statsCaptured and hasIcon then
+        local hasWeaponStats = (tonumber(current.damage or 0) > 0) or (tonumber(current.delay or 0) > 0)
+if statsCaptured and (hasIcon or hasNonZero or hasWeaponStats) then
             local w = mq.TLO.Window('ItemDisplayWindow')
             if w() and w.Open() then w.DoClose() end
 
@@ -858,6 +1001,15 @@ if statsCaptured and hasIcon then
                 printf('[EmuBot] Warning: icon not captured for %s', tostring(current.name or current.slotname or 'unknown item'))
             elseif not hasNonZero then
                 -- No stats found, but we at least reset them to zero for consistency.
+            end
+            -- If we still managed to get any useful stats (weapon or otherwise), persist them
+            if currentBot and ((tonumber(current.ac or 0) > 0) or (tonumber(current.hp or 0) > 0) or (tonumber(current.mana or 0) > 0)
+                or (tonumber(current.damage or 0) > 0) or (tonumber(current.delay or 0) > 0)) then
+                local data = bot_inventory.getBotInventory and bot_inventory.getBotInventory(currentBot)
+                if data then
+                    local meta = bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[currentBot] or nil
+                    db.save_bot_inventory(currentBot, data, meta)
+                end
             end
             enqueueTask(botUI._processNextScan)
             return true
@@ -1082,7 +1234,7 @@ local function canItemBeUsedByClass(itemTLO, className)
                 ["CLR"] = "CLERIC", 
                 ["PAL"] = "PALADIN",
                 ["RNG"] = "RANGER",
-                ["SHD"] = "SHADOW KNIGHT", ["SK"] = "SHADOW KNIGHT", ["SHADOWKNIGHT"] = "SHADOW KNIGHT",
+                ["SHD"] = "SHADOWKNIGHT", ["SK"] = "SHADOWKNIGHT", ["SHADOWKNIGHT"] = "SHADOWKNIGHT",
                 ["DRU"] = "DRUID",
                 ["MNK"] = "MONK",
                 ["BRD"] = "BARD",
@@ -2067,7 +2219,7 @@ local function get_bot_class_abbrev(botName)
         CLR='CLR', CLERIC='CLR',
         PAL='PAL', PALADIN='PAL',
         RNG='RNG', RANGER='RNG',
-        SHD='SHD', ['SHADOW KNIGHT']='SHD', SHADOWKNIGHT='SHD', SK='SHD',
+        SHD='SHD', ['SHADOWKNIGHT']='SHD', SHADOWKNIGHT='SHD', SK='SHD',
         DRU='DRU', DRUID='DRU',
         MNK='MNK', MONK='MNK',
         BRD='BRD', BARD='BRD',
@@ -2477,10 +2629,12 @@ EmuBot_PushRounding()
 
         if ImGui.Button('Scan Bot', buttonWidth, 0) then
             local itemsToScan = {}
-for _, it in ipairs(equippedItems or {}) do
-                local missing = (not it.ac and not it.hp and not it.mana)
-                    or ((it.ac or 0) == 0 and (it.hp or 0) == 0 and (it.mana or 0) == 0)
-                if missing then
+            for _, it in ipairs(equippedItems or {}) do
+                local missingBasic = (not it.ac and not it.hp and not it.mana)
+                    or ((tonumber(it.ac or 0) == 0) and (tonumber(it.hp or 0) == 0) and (tonumber(it.mana or 0) == 0))
+                local sid = tonumber(it.slotid or -1) or -1
+                local missingWeapon = (sid == 11 or sid == 13 or sid == 14) and ((tonumber(it.damage or 0) == 0) or (tonumber(it.delay or 0) == 0))
+                if missingBasic or missingWeapon then
                     table.insert(itemsToScan, it)
                 end
             end
@@ -2511,7 +2665,14 @@ if ImGui.Button('Close', buttonWidth, 0) then
         
         if not botUI._scanAllActive then
             if ImGui.Button('Scan All', buttonWidth, 0) then
-                botUI.startScanAllBots()
+                -- Always refresh the bot list first and show the confirmation popup.
+                if bot_inventory and bot_inventory.refreshBotList then
+                    bot_inventory.refreshBotList()
+                end
+                -- Store the original camp setting before showing popup
+                botUI._originalCampSetting = botUI.disableCampDuringScanAll
+                -- Open the confirmation popup (we'll kick off after refresh on YES/NO)
+                ImGui.OpenPopup('Scan All Bots##ScanAllConfirm')
             end
             if ImGui.IsItemHovered() then
                 local tooltipText = 'Spawn all bots and gather their inventory data'
@@ -2864,6 +3025,38 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
         ImGui.Text(string.format('Links: %d/%d', withLinks, withLinks + withoutLinks))
     end
 
+    -- Show the scan all confirmation popup
+    ImGui.SetNextWindowSize(ImVec2(500, 200), ImGuiCond.Always)
+    if ImGui.BeginPopupModal('Scan All Bots##ScanAllConfirm', true, ImGuiWindowFlags.AlwaysAutoResize) then
+        ImGui.TextWrapped('Do you have more bots created than you can spawn? We can automatically camp each bot after scanning, so that you can scan every bot you\'ve created. Would you like us to do so?')
+        
+        ImGui.Spacing()
+        ImGui.Separator()
+        ImGui.Spacing()
+        
+        if ImGui.Button('YES', ImVec2(120, 30)) then
+            -- Start scan with camping enabled (refresh bot list first)
+            botUI._startScanAllAfterRefresh(false)
+            ImGui.CloseCurrentPopup()
+        end
+        
+        ImGui.SameLine()
+        
+        if ImGui.Button('NO', ImVec2(120, 30)) then
+            -- Start scan with camping disabled (refresh bot list first)
+            botUI._startScanAllAfterRefresh(true)
+            ImGui.CloseCurrentPopup()
+        end
+        
+        ImGui.SameLine()
+        
+        if ImGui.Button('Cancel', ImVec2(120, 30)) then
+            ImGui.CloseCurrentPopup()
+        end
+        
+        ImGui.EndPopup()
+    end
+
     ImGui.End()
     EmuBot_PopRounding()
 end
@@ -3162,8 +3355,26 @@ local function main()
         bot_inventory.process()
         bot_groups.process_invitations()
         processDeferredTasks()
+        
+        -- Process delayed refresh after bot creation
+        if _G.EmuBotDelayedRefresh and not _G.EmuBotDelayedRefresh.executed then
+            local elapsed = os.time() - _G.EmuBotDelayedRefresh.scheduled
+            if elapsed >= _G.EmuBotDelayedRefresh.delay then
+                if bot_inventory and bot_inventory.refreshBotList then
+                    bot_inventory.refreshBotList()
+                end
+                _G.EmuBotDelayedRefresh.executed = true
+                _G.EmuBotDelayedRefresh = nil
+            end
+        end
+        
         mq.delay(50)
     end
 end
 
 main()
+-- Expose a simple global toggle to enable DB debug logging from chat:
+-- Usage: /lua eval EmuBotDBDebug(true)  or  /lua eval EmuBotDBDebug(false)
+_G.EmuBotDBDebug = function(enabled)
+    if db and db.set_debug then db.set_debug(enabled) end
+end

@@ -127,6 +127,8 @@ local function cloneItemForExport(item)
         ac = item.ac,
         hp = item.hp,
         mana = item.mana,
+        damage = item.damage,
+        delay = item.delay,
         qty = item.qty,
         nodrop = item.nodrop,
     }
@@ -240,23 +242,25 @@ local function encodeSnapshotAsJSON(snapshot)
 end
 
 local function encodeSnapshotAsCSV(snapshot)
-    local headers = {
-        "BotName",
-        "Location",
-        "SlotID",
-        "SlotName",
-        "ItemName",
-        "ItemID",
-        "AC",
-        "HP",
-        "Mana",
-        "Icon",
-        "Quantity",
-        "Charges",
-        "StackSize",
-        "NoDrop",
-        "ItemURL",
-    }
+    headers = {
+            "BotName",
+            "Location",
+            "SlotID",
+            "SlotName",
+            "ItemName",
+            "ItemID",
+            "AC",
+            "HP",
+            "Mana",
+            "Damage",
+            "Delay",
+            "Icon",
+            "Quantity",
+            "Charges",
+            "StackSize",
+            "NoDrop",
+            "ItemURL",
+        }
 
     local function csvEscape(value)
         if value == nil then return "" end
@@ -289,6 +293,8 @@ local function encodeSnapshotAsCSV(snapshot)
                 csvEscape(item.ac),
                 csvEscape(item.hp),
                 csvEscape(item.mana),
+                csvEscape(item.damage),
+                csvEscape(item.delay),
                 csvEscape(item.icon),
                 csvEscape(item.qty),
                 csvEscape(item.charges),
@@ -355,29 +361,15 @@ function BotInventory.parseItemLinkData(itemLinkString)
     for _, link in ipairs(links) do
         if link.type == mq.LinkTypes.Item then
             local parsed = mq.ParseItemLink(link.link)
-            -- Best-effort extraction: different client builds may expose
-            -- lowercase or uppercase keys for stats. Fall back to 0.
-            local ac, hp, mana = 0, 0, 0
+            -- Best-effort extraction: treat missing fields as nil (unknown)
+            local ac, hp, mana, damage, delay = nil, nil, nil, nil, nil
             if parsed then
                 -- First, try fields directly present on parsed
-                ac   = (parsed.ac or parsed.AC or 0)
-                hp   = (parsed.hp or parsed.HP or 0)
-                mana = (parsed.mana or parsed.Mana or parsed.MANA or 0)
-                -- If not present, try Item TLO via ID or name
-                if (ac == 0 and hp == 0 and mana == 0) and mq and mq.TLO and mq.TLO.Item then
-                    local itemTLO
-                    if parsed.itemID then
-                        itemTLO = mq.TLO.Item(parsed.itemID)
-                    end
-                    if (not itemTLO or not itemTLO() or itemTLO.ID() == 0) and link.text then
-                        itemTLO = mq.TLO.Item("=" .. link.text)
-                    end
-                    if itemTLO and itemTLO() then
-                        ac = tonumber(itemTLO.AC() or 0) or 0
-                        hp = tonumber(itemTLO.HP() or 0) or 0
-                        mana = tonumber(itemTLO.Mana() or 0) or 0
-                    end
-                end
+                ac   = parsed.ac or parsed.AC or ac
+                hp   = parsed.hp or parsed.HP or hp
+                mana = parsed.mana or parsed.Mana or parsed.MANA or mana
+                damage = parsed.damage or parsed.Damage or damage
+                delay = parsed.delay or parsed.Delay or delay
             end
             local iconID = 0
             if parsed then
@@ -392,9 +384,11 @@ function BotInventory.parseItemLinkData(itemLinkString)
                 iconID  = iconID,
                 icon    = iconID,
                 linkData = link,
-                ac = tonumber(ac) or 0,
-                hp = tonumber(hp) or 0,
-                mana = tonumber(mana) or 0,
+                ac = ac ~= nil and (tonumber(ac) or 0) or nil,
+                hp = hp ~= nil and (tonumber(hp) or 0) or nil,
+                mana = mana ~= nil and (tonumber(mana) or 0) or nil,
+                damage = damage ~= nil and (tonumber(damage) or 0) or nil,
+                delay = delay ~= nil and (tonumber(delay) or 0) or nil,
             }
         end
     end
@@ -457,9 +451,11 @@ local function displayBotInventory(line, slotNum, slotName)
             icon = (parsedItem and (parsedItem.iconID or parsedItem.icon or 0)) or 0,
             stackSize = parsedItem and parsedItem.stackSize or nil,
             charges = parsedItem and parsedItem.charges or nil,
-            ac = parsedItem and parsedItem.ac or 0,
-            hp = parsedItem and parsedItem.hp or 0,
-            mana = parsedItem and parsedItem.mana or 0,
+            ac = parsedItem and parsedItem.ac or nil,
+            hp = parsedItem and parsedItem.hp or nil,
+            mana = parsedItem and parsedItem.mana or nil,
+            damage = parsedItem and parsedItem.damage or nil,
+            delay = parsedItem and parsedItem.delay or nil,
             qty = 1,
             nodrop = 1
         }
@@ -470,10 +466,12 @@ local function displayBotInventory(line, slotNum, slotName)
             local it = eq[i]
             if tonumber(it.slotid) == tonumber(slotNum) then
                 -- Preserve stats if new values are zero
-                if (newItem.ac or 0) == 0 and (it.ac or 0) ~= 0 then newItem.ac = it.ac end
-                if (newItem.hp or 0) == 0 and (it.hp or 0) ~= 0 then newItem.hp = it.hp end
-                if (newItem.mana or 0) == 0 and (it.mana or 0) ~= 0 then newItem.mana = it.mana end
+                if (newItem.ac == nil) or ((newItem.ac or 0) == 0 and (it.ac or 0) ~= 0) then newItem.ac = newItem.ac ~= nil and newItem.ac or it.ac end
+                if (newItem.hp == nil) or ((newItem.hp or 0) == 0 and (it.hp or 0) ~= 0) then newItem.hp = newItem.hp ~= nil and newItem.hp or it.hp end
+                if (newItem.mana == nil) or ((newItem.mana or 0) == 0 and (it.mana or 0) ~= 0) then newItem.mana = newItem.mana ~= nil and newItem.mana or it.mana end
                 if (newItem.icon or 0) == 0 and (it.icon or 0) ~= 0 then newItem.icon = it.icon end
+                if (newItem.damage == nil) or ((newItem.damage or 0) == 0 and (it.damage or 0) ~= 0) then newItem.damage = newItem.damage ~= nil and newItem.damage or it.damage end
+                if (newItem.delay == nil) or ((newItem.delay or 0) == 0 and (it.delay or 0) ~= 0) then newItem.delay = newItem.delay ~= nil and newItem.delay or it.delay end
                 eq[i] = newItem
                 replaced = true
                 break
@@ -797,7 +795,8 @@ end
 --  itemID    - numeric itemID of the cursor item
 --  itemName  - name of the cursor item
 --  ac,hp,mana,icon (numbers) - optional stats/icon to set; nil treated as 0
-function BotInventory.applySwapFromCursor(botName, slotID, slotName, itemID, itemName, ac, hp, mana, icon)
+--  damage,delay (numbers) - optional weapon stats; nil treated as 0
+function BotInventory.applySwapFromCursor(botName, slotID, slotName, itemID, itemName, ac, hp, mana, icon, damage, delay)
     if not botName or slotID == nil then return false, 'bad args' end
 
     -- Ensure bot cache exists
@@ -811,19 +810,21 @@ function BotInventory.applySwapFromCursor(botName, slotID, slotName, itemID, ite
     local eq = BotInventory.bot_inventories[botName].equipped
 
     local newItem = {
-        name = itemName or 'Item',
-        slotid = tonumber(slotID),
-        slotname = slotName or tostring(slotID),
-        itemlink = nil,
-        rawline = nil,
-        itemID = tonumber(itemID) or 0,
-        icon = tonumber(icon or 0) or 0,
-        ac = tonumber(ac or 0) or 0,
-        hp = tonumber(hp or 0) or 0,
-        mana = tonumber(mana or 0) or 0,
-        qty = 1,
-        nodrop = 1,
-    }
+            name = itemName or 'Item',
+            slotid = tonumber(slotID),
+            slotname = slotName or tostring(slotID),
+            itemlink = nil,
+            rawline = nil,
+            itemID = tonumber(itemID) or 0,
+            icon = tonumber(icon or 0) or 0,
+            ac = tonumber(ac or 0) or 0,
+            hp = tonumber(hp or 0) or 0,
+            mana = tonumber(mana or 0) or 0,
+            damage = tonumber(damage or 0) or 0,
+            delay = tonumber(delay or 0) or 0,
+            qty = 1,
+            nodrop = 1,
+        }
 
     -- Replace existing slot entry or insert
     local replaced = false
@@ -881,13 +882,17 @@ function BotInventory.compareInventoryData(botName, oldData, newData)
             -- New item in this slot
             needsScan = (not newItem.ac or tonumber(newItem.ac) == 0) and
                        (not newItem.hp or tonumber(newItem.hp) == 0) and
-                       (not newItem.mana or tonumber(newItem.mana) == 0)
+                       (not newItem.mana or tonumber(newItem.mana) == 0) and
+                       (not newItem.damage or tonumber(newItem.damage) == 0) and
+                       (not newItem.delay or tonumber(newItem.delay) == 0)
             reason = "new item with missing stats"
         elseif oldItem.name ~= newItem.name or oldItem.itemID ~= newItem.itemID then
             -- Different item in the same slot
             needsScan = (not newItem.ac or tonumber(newItem.ac) == 0) and
                        (not newItem.hp or tonumber(newItem.hp) == 0) and
-                       (not newItem.mana or tonumber(newItem.mana) == 0)
+                       (not newItem.mana or tonumber(newItem.mana) == 0) and
+                       (not newItem.damage or tonumber(newItem.damage) == 0) and
+                       (not newItem.delay or tonumber(newItem.delay) == 0)
             reason = string.format("item changed from '%s' to '%s'", oldItem.name or "unknown", newItem.name or "unknown")
         else
             -- Same item, check for stat mismatches
@@ -899,10 +904,17 @@ function BotInventory.compareInventoryData(botName, oldData, newData)
             local newMana = tonumber(newItem.mana) or 0
             
             -- If old item had stats but new item doesn't, or stats changed significantly
-            if (oldAC > 0 or oldHP > 0 or oldMana > 0) and (newAC == 0 and newHP == 0 and newMana == 0) then
+            local oldDamage = tonumber(oldItem.damage) or 0
+            local oldDelay = tonumber(oldItem.delay) or 0
+            local newDamage = tonumber(newItem.damage) or 0
+            local newDelay = tonumber(newItem.delay) or 0
+            
+            if (oldAC > 0 or oldHP > 0 or oldMana > 0 or oldDamage > 0 or oldDelay > 0) and 
+               (newAC == 0 and newHP == 0 and newMana == 0 and newDamage == 0 and newDelay == 0) then
                 needsScan = true
                 reason = "stats missing from fresh data"
-            elseif (newAC == 0 and newHP == 0 and newMana == 0) and (not newItem.itemlink or newItem.itemlink == "") then
+            elseif (newAC == 0 and newHP == 0 and newMana == 0 and newDamage == 0 and newDelay == 0) and 
+                   (not newItem.itemlink or newItem.itemlink == "") then
                 needsScan = true
                 reason = "missing stats and itemlink"
             end

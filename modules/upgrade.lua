@@ -12,6 +12,7 @@ U._pending_refresh = {}
 
 -- Forward declaration so functions defined earlier can call it safely
 local get_cursor_stats
+local get_cursor_weapon_stats
 
 local function printf(fmt, ...)
     if mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end
@@ -205,6 +206,7 @@ local function swap_to_bot(botName, itemID, slotID, slotName)
 
     -- Optimistically update cache/DB using cursor data to avoid ^invlist roundtrip
     local ac, hp, mana = get_cursor_stats()
+    local dmg, dly = get_cursor_weapon_stats()
     local icon = 0
     local ok_icon, icon_val = pcall(function()
         if mq.TLO.Cursor.Icon then return tonumber(mq.TLO.Cursor.Icon() or 0) or 0 end
@@ -213,7 +215,7 @@ local function swap_to_bot(botName, itemID, slotID, slotName)
     if ok_icon and icon_val then icon = icon_val end
     if bot_inventory and bot_inventory.applySwapFromCursor and slotID ~= nil then
         bot_inventory.applySwapFromCursor(botName, slotID, slotName, tonumber(itemID) or 0,
-            mq.TLO.Cursor.Name() or 'Item', ac, hp, mana, icon)
+            mq.TLO.Cursor.Name() or 'Item', ac, hp, mana, icon, dmg, dly)
     end
     return true
 end
@@ -239,40 +241,56 @@ function U.clear()
     clear_candidates()
 end
 
--- Helper to read cursor item basic stats safely
+-- Helper to check if item is a weapon type
+local function is_weapon_type(itemType)
+    if not itemType then return false end
+    local typ = tostring(itemType):upper()
+    -- Check for weapon types
+    local weaponTypes = {
+        '1H SLASHING', '2H SLASHING',
+        '1H BLUNT', '2H BLUNT',
+        'PIERCING', '2H PIERCING',
+        'HAND TO HAND',
+        'BOW',
+        'THROWING'
+    }
+    for _, weaponType in ipairs(weaponTypes) do
+        if typ:find(weaponType) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Helper to read cursor item weapon stats safely (without DisplayItem dependency)
+get_cursor_weapon_stats = function()
+    local cur = mq.TLO.Cursor
+    if not cur or not cur() then return 0, 0 end
+
+    -- Check if this is a weapon first
+    local isWeapon = is_weapon_type(cur.Type())
+    if not isWeapon then
+        return 0, 0  -- Not a weapon, return 0 for damage and delay
+    end
+
+    -- Get damage and delay directly from cursor item (avoiding DisplayItem dependency)
+    local cur_damage = tonumber(cur.Damage() or 0) or 0
+    local cur_delay = tonumber(cur.ItemDelay() or 0) or 0
+
+    return cur_damage, cur_delay
+end
+
+-- Helper to read cursor item basic stats safely (without DisplayItem dependency)
 get_cursor_stats = function()
     local cur = mq.TLO.Cursor
     if not cur or not cur() then return 0, 0, 0 end
 
-    -- Prefer DisplayItem.Item stats (base values), then fall back to cursor (often shows totals)
-    local di_ac, di_hp, di_mana = 0, 0, 0
-    if mq.TLO.DisplayItem and mq.TLO.DisplayItem() and mq.TLO.DisplayItem.Item and mq.TLO.DisplayItem.Item() then
-        local di = mq.TLO.DisplayItem.Item
-        local function safe_num(getter)
-            if not getter then return 0 end
-            local ok, v = pcall(function() return tonumber(getter()) or 0 end)
-            return ok and v or 0
-        end
-        -- AC: use AC if available; otherwise TotalAC
-        di_ac = safe_num(di.AC)
-        if di_ac == 0 and di.TotalAC then di_ac = safe_num(di.TotalAC) end
-        -- HP: some builds expose HitPoints instead of HP
-        di_hp = safe_num(di.HP)
-        if di_hp == 0 and di.HitPoints then di_hp = safe_num(di.HitPoints) end
-        -- Mana
-        di_mana = safe_num(di.Mana)
-    end
-
+    -- Get stats directly from cursor item (avoiding DisplayItem dependency)
     local cur_ac = tonumber(cur.AC() or 0) or 0
     local cur_hp = tonumber(cur.HP() or 0) or 0
     local cur_mana = tonumber(cur.Mana() or 0) or 0
 
-    -- Choose display-item values when present (>0), otherwise cursor totals
-    local ac = (di_ac and di_ac > 0) and di_ac or cur_ac
-    local hp = (di_hp and di_hp > 0) and di_hp or cur_hp
-    local mana = (di_mana and di_mana > 0) and di_mana or cur_mana
-
-    return ac, hp, mana
+    return cur_ac, cur_hp, cur_mana
 end
 
 function U.draw_tab()
@@ -303,14 +321,28 @@ function U.draw_tab()
         return
     end
 
-    if ImGui.BeginTable('EmuBotUpgradeTable', 8, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+    -- Check if the cursor item is a weapon to determine the number of columns
+    local isWeapon = false
+    if mq.TLO.Cursor() then
+        isWeapon = is_weapon_type(mq.TLO.Cursor.Type())
+    end
+
+    -- Determine number of columns based on whether the item is a weapon (removed Upgrade column)
+    local numCols = isWeapon and 9 or 7
+    if ImGui.BeginTable('EmuBotUpgradeTable', numCols, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
         ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 120)
-        ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
-        ImGui.TableSetupColumn('Δ AC', ImGuiTableColumnFlags.WidthFixed, 60)
-        ImGui.TableSetupColumn('Δ HP', ImGuiTableColumnFlags.WidthFixed, 60)
-        ImGui.TableSetupColumn('Δ Mana', ImGuiTableColumnFlags.WidthFixed, 70)
+        
+        -- Add weapon columns if this is a weapon
+        if isWeapon then
+            ImGui.TableSetupColumn('Dmg', ImGuiTableColumnFlags.WidthFixed, 60)
+            ImGui.TableSetupColumn('Delay', ImGuiTableColumnFlags.WidthFixed, 70)
+        end
+        
+        ImGui.TableSetupColumn('AC', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 70)
         ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableHeadersRow()
 
@@ -343,22 +375,50 @@ function U.draw_tab()
             ImGui.TableNextColumn()
             ImGui.Text(row.slotname or ('Slot ' .. tostring(row.slotid or '?')))
 
-            ImGui.TableNextColumn()
-            ImGui.Text(row.itemName or 'Upgrade Item')
-
             -- Compute deltas for quick glance in the main table
             local upgAC, upgHP, upgMana = get_cursor_stats()
+            local upgDamage, upgDelay = get_cursor_weapon_stats()
             local cAC, cHP, cMana = 0, 0, 0
+            local cDamage, cDelay = 0, 0
+            
             if bot_inventory and bot_inventory.getBotEquippedItem and row.bot and row.slotid ~= nil then
                 local curItem = bot_inventory.getBotEquippedItem(row.bot, row.slotid)
                 cAC = tonumber(curItem and curItem.ac or 0) or 0
                 cHP = tonumber(curItem and curItem.hp or 0) or 0
                 cMana = tonumber(curItem and curItem.mana or 0) or 0
+                
+                -- Get current equipped item's weapon stats if this is a weapon (without DisplayItem dependency)
+                if isWeapon and curItem and curItem.name then
+                    local currentItemTLO = mq.TLO.FindItem(string.format('= %s', curItem.name))
+                    if currentItemTLO and currentItemTLO() then
+                        local isCurrentWeapon = is_weapon_type(currentItemTLO.Type())
+                        if isCurrentWeapon then
+                            cDamage = tonumber(currentItemTLO.Damage() or 0) or 0
+                            cDelay = tonumber(currentItemTLO.ItemDelay() or 0) or 0
+                        end
+                    end
+                end
             end
+            
             local dAC = (upgAC or 0) - cAC
             local dHP = (upgHP or 0) - cHP
             local dMana = (upgMana or 0) - cMana
+            local dDamage = (upgDamage or 0) - cDamage
+            local dDelay = (upgDelay or 0) - cDelay
 
+            -- Weapon deltas (colored) - only if weapon
+            if isWeapon then
+                local function colortext(delta)
+                    if delta > 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, '+' .. tostring(delta))
+                    elseif delta < 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(delta))
+                    else ImGui.Text('0') end
+                end
+
+                ImGui.TableNextColumn(); colortext(dDamage)
+                ImGui.TableNextColumn(); colortext(dDelay)
+            end
+
+            -- Other deltas (colored)
             local function colortext(delta)
                 if delta > 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, '+' .. tostring(delta))
                 elseif delta < 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(delta))
@@ -458,10 +518,23 @@ function U.draw_compare_window()
     local cur = mq.TLO.Cursor
     local upgName = cur() and (cur.Name() or 'Upgrade Item') or 'Upgrade Item'
     local upgAC, upgHP, upgMana = get_cursor_stats()
+    local upgDamage, upgDelay = get_cursor_weapon_stats()
+    
+    -- Check if the cursor item is a weapon to determine if we should show weapon stats
+    local isWeapon = false
+    if cur and cur() then
+        isWeapon = is_weapon_type(cur.Type())
+    end
 
-    ImGui.Text('Upgrade Item: ' .. tostring(upgName))
+    -- Highlight the upgrade item header in a gold-ish color for visibility
+    local goldR, goldG, goldB = 0.95, 0.85, 0.20
+    ImGui.TextColored(goldR, goldG, goldB, 1.0, 'Upgrade Item: ' .. tostring(upgName))
     ImGui.SameLine()
-    ImGui.Text(string.format('(AC %d  HP %d  Mana %d)', upgAC, upgHP, upgMana))
+    if isWeapon then
+        ImGui.TextColored(goldR, goldG, goldB, 1.0, string.format('(AC %d  HP %d  Mana %d  Dmg %d  Delay %d)', upgAC, upgHP, upgMana, upgDamage, upgDelay))
+    else
+        ImGui.TextColored(goldR, goldG, goldB, 1.0, string.format('(AC %d  HP %d  Mana %d)', upgAC, upgHP, upgMana))
+    end
     ImGui.Separator()
 
     if #U._candidates == 0 then
@@ -470,15 +543,23 @@ function U.draw_compare_window()
         return
     end
 
-    if ImGui.BeginTable('EmuBotUpgradeCompare', 9, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+    -- Determine number of columns based on whether the item is a weapon (removed Upgrade column)
+    local numCols = isWeapon and 10 or 8
+    if ImGui.BeginTable('EmuBotUpgradeCompare', numCols, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
         ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableSetupColumn('Current', ImGuiTableColumnFlags.WidthStretch)
-        ImGui.TableSetupColumn('Upgrade', ImGuiTableColumnFlags.WidthStretch)
-        ImGui.TableSetupColumn('Δ AC', ImGuiTableColumnFlags.WidthFixed, 60)
-        ImGui.TableSetupColumn('Δ HP', ImGuiTableColumnFlags.WidthFixed, 60)
-        ImGui.TableSetupColumn('Δ Mana', ImGuiTableColumnFlags.WidthFixed, 70)
+        
+        -- Add weapon columns if this is a weapon
+        if isWeapon then
+            ImGui.TableSetupColumn('Dmg', ImGuiTableColumnFlags.WidthFixed, 60)
+            ImGui.TableSetupColumn('Delay', ImGuiTableColumnFlags.WidthFixed, 70)
+        end
+        
+        ImGui.TableSetupColumn('AC', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 60)
+        ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 70)
         ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 90)
         ImGui.TableHeadersRow()
 
@@ -494,10 +575,24 @@ function U.draw_compare_window()
             local cAC = tonumber(curItem and curItem.ac or 0) or 0
             local cHP = tonumber(curItem and curItem.hp or 0) or 0
             local cMana = tonumber(curItem and curItem.mana or 0) or 0
+            
+            -- Calculate weapon stats for current equipped item: prefer DB values, fallback to MQ only if missing
+            local cDamage = tonumber(curItem and curItem.damage or 0) or 0
+            local cDelay = tonumber(curItem and curItem.delay or 0) or 0
+            if isWeapon and curItem and curItem.name and (cDamage == 0 and cDelay == 0) then
+                -- As a fallback, attempt to read from MQ for the equipped item by exact name
+                local currentItemTLO = mq.TLO.FindItem(string.format('= %s', curItem.name or ''))
+                if currentItemTLO and currentItemTLO() then
+                    cDamage = tonumber(currentItemTLO.Damage() or 0) or 0
+                    cDelay = tonumber(currentItemTLO.ItemDelay() or 0) or 0
+                end
+            end
 
             local dAC = (upgAC or 0) - cAC
             local dHP = (upgHP or 0) - cHP
             local dMana = (upgMana or 0) - cMana
+            local dDamage = (upgDamage or 0) - cDamage
+            local dDelay = (upgDelay or 0) - cDelay
 
             ImGui.TableNextColumn()
             if ImGui.Selectable((row.bot or 'Unknown') .. '##target_' .. tostring(i), false, ImGuiSelectableFlags.None) then
@@ -520,19 +615,44 @@ function U.draw_compare_window()
             ImGui.TableNextColumn(); ImGui.Text(row.class or 'UNK')
             ImGui.TableNextColumn(); ImGui.Text(row.slotname or ('Slot ' .. tostring(row.slotid or '?')))
 
-            -- Current (name only)
+            -- Current (name with clickable link)
             ImGui.TableNextColumn()
             if curItem and curItem.name and curItem.name ~= '' then
-                ImGui.Text(curItem.name)
+                -- Create a link to the current item if we have itemlink data
+                if curItem.itemlink and curItem.itemlink ~= '' then
+                    local links = mq.ExtractLinks(curItem.itemlink)
+                    if links and #links > 0 then
+                        if ImGui.Selectable(curItem.name, false, ImGuiSelectableFlags.None) then
+                            -- Execute the item link to display it
+                            if mq.ExecuteTextLink then
+                                mq.ExecuteTextLink(links[1])
+                            end
+                        end
+                    else
+                        -- Fallback to regular text if no link data available
+                        ImGui.Text(curItem.name)
+                    end
+                else
+                    -- If no itemlink data, just show as text for now
+                    ImGui.Text(curItem.name)
+                end
             else
                 ImGui.Text('--')
             end
 
-            -- Upgrade (name only)
-            ImGui.TableNextColumn()
-            ImGui.Text(upgName)
+            -- Weapon Deltas (colored) - only if weapon
+            if isWeapon then
+                local function colortext(delta)
+                    if delta > 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, '+' .. tostring(delta))
+                    elseif delta < 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(delta))
+                    else ImGui.Text('0') end
+                end
 
-            -- Deltas (colored)
+                ImGui.TableNextColumn(); colortext(dDamage)
+                ImGui.TableNextColumn(); colortext(dDelay)
+            end
+
+            -- Other Deltas (colored)
             local function colortext(delta)
                 if delta > 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, '+' .. tostring(delta))
                 elseif delta < 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(delta))

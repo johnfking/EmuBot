@@ -9,7 +9,7 @@ local M = {}
 
 -- Canonical class names (ordered longest first to prefer multi-word matches)
 local CLASS_NAMES = {
-    'Shadow Knight',
+    'Shadowknight',
     'Necromancer',
     'Beastlord',
     'Berserker',
@@ -159,10 +159,43 @@ local function action_invite(name)
 end
 
 local function action_camp(name)
-    if target_bot(name) then
-        mq.cmd('/say ^botcamp')
+    -- Attempt to target first (non-blocking/optimistic)
+    target_bot(name)
+
+    -- If we have the global enqueueTask, schedule a short verification with retries
+    if _G.enqueueTask then
+        local attempts = 0
+        local maxAttempts = 8
+        local function verify_and_camp()
+            attempts = attempts + 1
+            local t = mq.TLO.Target
+            local hasTarget = t and t() and (t.Name() == name)
+            if hasTarget then
+                mq.cmd('/say ^botcamp')
+                return true
+            end
+            if attempts >= maxAttempts then
+                printf('[EmuBot] Could not verify target for %s to camp', name)
+                return true
+            end
+            _G.enqueueTask(function()
+                mq.delay(250)
+                verify_and_camp()
+            end)
+            return true
+        end
+        _G.enqueueTask(function()
+            mq.delay(250)
+            verify_and_camp()
+        end)
     else
-        printf('[EmuBot] Could not target %s to camp', name)
+        -- Fallback: best-effort immediate check without blocking the UI
+        local t = mq.TLO.Target
+        if t and t() and (t.Name() == name) then
+            mq.cmd('/say ^botcamp')
+        else
+            printf('[EmuBot] Could not verify target for %s to camp', name)
+        end
     end
 end
 
@@ -186,6 +219,15 @@ local function action_create_bot(name, class, race, gender)
             mq.delay(2000)
             bot_inventory.refreshBotList()
         end)
+    else
+        -- Fallback: Direct delayed refresh if enqueueTask is not available
+        -- Using mq.delay directly would block the UI, so we need to use a different approach
+        -- Schedule the refresh via a temporary global function that gets called in the game loop
+        _G.EmuBotDelayedRefresh = {
+            scheduled = os.time(),
+            delay = 2, -- 2 seconds delay
+            executed = false
+        }
     end
     
     return true

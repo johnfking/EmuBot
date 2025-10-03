@@ -7,6 +7,27 @@ local ok_sqlite, sqlite3 = pcall(require, 'lsqlite3')
 local M = {}
 M._db = nil
 M._db_path = nil
+M._debug = false
+
+function M.set_debug(enabled)
+    M._debug = not not enabled
+    printf('[EmuBot][DB] Debug logging %s', M._debug and 'ENABLED' or 'DISABLED')
+    if M._debug and M._db then
+        -- Dump items schema for quick verification
+        printf('[EmuBot][DB] items schema:')
+        for row in M._db:nrows("PRAGMA table_info('items');") do
+            printf('  - %s (%s)', tostring(row.name), tostring(row.type))
+        end
+    end
+end
+
+local function dump_schema_if_debug()
+    if not M._debug or not M._db then return end
+    printf('[EmuBot][DB] items schema:')
+    for row in M._db:nrows("PRAGMA table_info('items');") do
+        printf('  - %s (%s)', tostring(row.name), tostring(row.type))
+    end
+end
 
 local function printf(fmt, ...)
     if mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end
@@ -126,7 +147,8 @@ local function exec_ddl()
         aug3Name TEXT, aug3link TEXT, aug3Icon INTEGER,
         aug4Name TEXT, aug4link TEXT, aug4Icon INTEGER,
         aug5Name TEXT, aug5link TEXT, aug5Icon INTEGER,
-        aug6Name TEXT, aug6link TEXT, aug6Icon INTEGER
+        aug6Name TEXT, aug6link TEXT, aug6Icon INTEGER,
+        damage INTEGER, delay INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_items_bot ON items(bot_name);
@@ -155,11 +177,40 @@ local function exec_ddl()
     return M._db:exec(ddl) == sqlite3.OK
 end
 
+-- Lightweight migrations: ensure new columns exist on existing databases
+local function column_exists(table_name, column_name)
+    local exists = false
+    for row in M._db:nrows(string.format("PRAGMA table_info('%s');", table_name)) do
+        if tostring(row.name) == tostring(column_name) then
+            exists = true
+            break
+        end
+    end
+    return exists
+end
+
+local function run_migrations()
+    -- Add damage/delay columns to items if they are missing
+    if not column_exists('items', 'damage') then
+        M._db:exec('ALTER TABLE items ADD COLUMN damage INTEGER;')
+        -- Backfill to 0 for existing rows
+        M._db:exec('UPDATE items SET damage = 0 WHERE damage IS NULL;')
+    end
+    if not column_exists('items', 'delay') then
+        M._db:exec('ALTER TABLE items ADD COLUMN delay INTEGER;')
+        -- Backfill to 0 for existing rows
+        M._db:exec('UPDATE items SET delay = 0 WHERE delay IS NULL;')
+    end
+end
+
 function M.init()
     local ok, err = open_db()
     if not ok then return false, err end
     local okddl = exec_ddl()
     if not okddl then return false, 'failed to create schema' end
+    -- Ensure schema migrations for existing DBs
+    run_migrations()
+    dump_schema_if_debug()
     printf('[EmuBot][DB] Using %s', tostring(M._db_path))
     return true
 end
@@ -195,6 +246,12 @@ local function last_error()
 end
 
 local function insert_item(botName, location, it)
+    if M._debug then
+        printf('[EmuBot][DB][insert] bot=%s loc=%s slot=%s name="%s" itemID=%s ac=%s hp=%s mana=%s dmg=%s dly=%s linkLen=%s rawLen=%s',
+            tostring(botName), tostring(location), tostring(it.slotid), tostring(it.name or ''), tostring(it.itemID or 'nil'),
+            tostring(it.ac or 'nil'), tostring(it.hp or 'nil'), tostring(it.mana or 'nil'), tostring(it.damage or 'nil'), tostring(it.delay or 'nil'),
+            tostring(it.itemlink and #tostring(it.itemlink) or 0), tostring(it.rawline and #tostring(it.rawline) or 0))
+    end
     local stmt = M._db:prepare([[INSERT INTO items(
         bot_name, location, slotid, slotname, name, itemID, icon, ac, hp, mana,
         itemlink, rawline, qty, nodrop, stackSize, charges,
@@ -203,9 +260,14 @@ local function insert_item(botName, location, it)
         aug3Name, aug3link, aug3Icon,
         aug4Name, aug4link, aug4Icon,
         aug5Name, aug5link, aug5Icon,
-        aug6Name, aug6link, aug6Icon
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]])
-    if not stmt then return false, 'prepare failed' end
+        aug6Name, aug6link, aug6Icon,
+        damage, delay
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]])
+    if not stmt then
+        local err = last_error()
+        if M._debug then printf('[EmuBot][DB][insert] prepare failed: %s', tostring(err)) end
+        return false, 'prepare failed'
+    end
     stmt:bind_values(
         botName, location,
         tonumber(it.slotid), it.slotname, it.name, tonumber(it.itemID), tonumber(it.icon),
@@ -216,22 +278,29 @@ local function insert_item(botName, location, it)
         it.aug3Name, it.aug3link, tonumber(it.aug3Icon),
         it.aug4Name, it.aug4link, tonumber(it.aug4Icon),
         it.aug5Name, it.aug5link, tonumber(it.aug5Icon),
-        it.aug6Name, it.aug6link, tonumber(it.aug6Icon)
+        it.aug6Name, it.aug6link, tonumber(it.aug6Icon),
+        tonumber(it.damage) or 0, tonumber(it.delay) or 0
     )
     local rc = stmt:step()
     local ok = (rc == sqlite3.DONE)
     if not ok then
         local err = last_error()
+        if M._debug then printf('[EmuBot][DB][insert] step failed: %s', tostring(err)) end
         stmt:finalize()
         return false, err
     end
     stmt:finalize()
+    if M._debug then printf('[EmuBot][DB][insert] OK for %s:%s slot %s', tostring(botName), tostring(location), tostring(it.slotid)) end
     return true
 end
 
 function M.save_bot_inventory(botName, data, meta)
     if not M._db then return false, 'db not initialized' end
     if not botName or not data then return false, 'bad args' end
+    if M._debug then
+        local eqc = (data.equipped and #data.equipped) or 0
+        printf('[EmuBot][DB][save] bot=%s equipped=%d', tostring(botName), eqc)
+    end
     M._db:exec('BEGIN;')
     local ok1 = upsert_bot(botName, meta or {})
     if not ok1 then M._db:exec('ROLLBACK;'); return false, 'upsert bot failed' end
@@ -250,6 +319,7 @@ for _, it in ipairs((data.equipped) or {}) do
     -- Future: bags/bank persistence can be added similarly
 
     M._db:exec('COMMIT;')
+    if M._debug then printf('[EmuBot][DB][save] COMMIT bot=%s', tostring(botName)) end
     return true
 end
 
@@ -291,7 +361,7 @@ function M.load_all()
             table.insert(result[b.name].equipped, {
                 name = r.name, slotid = tonumber(r.slotid), slotname = r.slotname,
                 itemlink = r.itemlink, rawline = r.rawline, itemID = tonumber(r.itemID), icon = tonumber(r.icon),
-                ac = tonumber(r.ac), hp = tonumber(r.hp), mana = tonumber(r.mana), qty = tonumber(r.qty), nodrop = tonumber(r.nodrop),
+                ac = tonumber(r.ac) or 0, hp = tonumber(r.hp) or 0, mana = tonumber(r.mana) or 0, qty = tonumber(r.qty) or 0, nodrop = tonumber(r.nodrop) or 0,
                 stackSize = tonumber(r.stackSize), charges = tonumber(r.charges),
                 aug1Name = r.aug1Name, aug1link = r.aug1link, aug1Icon = tonumber(r.aug1Icon),
                 aug2Name = r.aug2Name, aug2link = r.aug2link, aug2Icon = tonumber(r.aug2Icon),
@@ -299,6 +369,7 @@ function M.load_all()
                 aug4Name = r.aug4Name, aug4link = r.aug4link, aug4Icon = tonumber(r.aug4Icon),
                 aug5Name = r.aug5Name, aug5link = r.aug5link, aug5Icon = tonumber(r.aug5Icon),
                 aug6Name = r.aug6Name, aug6link = r.aug6link, aug6Icon = tonumber(r.aug6Icon),
+                damage = tonumber(r.damage) or 0, delay = tonumber(r.delay) or 0,
             })
         end
     end
