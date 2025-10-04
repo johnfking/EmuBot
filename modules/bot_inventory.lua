@@ -2,6 +2,7 @@
 local mq = require("mq")
 local json = require("dkjson")
 local db = require('EmuBot.modules.db')
+local spell_enums = require('EmuBot.modules.spell_enums')
 
 local BotInventory = {}
 BotInventory.bot_inventories = {}
@@ -19,6 +20,25 @@ BotInventory.bot_list_capture_set = {}
 BotInventory.invlist_issued_time = nil
 BotInventory._resources_dir = nil
 BotInventory._capture_count = {}
+BotInventory.SpellTypes = spell_enums.SpellTypes
+
+---Normalize a spell type identifier into the canonical short name or numeric ID
+---@param value any
+---@return string|number
+function BotInventory.getSpellTypeIdentifier(value)
+    local short, err = spell_enums.get_short_name(value)
+    if not short then
+        error(string.format('[EmuBot] %s', err or 'Invalid spell type identifier'))
+    end
+    return short
+end
+
+---Normalize a map of spell max thresholds to use short names for keys.
+---@param threshold_map table
+---@return table
+function BotInventory.normalizeSpellMaxThresholds(threshold_map)
+    return spell_enums.normalize_spell_max_thresholds(threshold_map)
+end
 
 local function normalizePathSeparators(path)
     return path and path:gsub('\\\\', '/') or nil
