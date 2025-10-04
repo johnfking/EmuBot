@@ -77,4 +77,37 @@ assert_error(function()
     SpellEnums.normalize_spell_max_thresholds({ [SpellEnums.SpellTypes.Nuke] = 'not-a-number' })
 end, 'Threshold value for nuke')
 
+print('[tests] spell_enums: invoking set_spell_max_threshold helper')
+local call_log = {}
+local fake_bot = {}
+function fake_bot:spellmaxthresholds(spell_type, threshold, condition)
+    table.insert(call_log, {
+        self = self,
+        spell_type = spell_type,
+        threshold = threshold,
+        condition = condition,
+    })
+    return 'ok'
+end
+
+local result = SpellEnums.set_spell_max_threshold(fake_bot, SpellEnums.SpellTypes.FastHeals, '40', 'spawned-only')
+assert_equal(result, 'ok', 'Expected helper to return underlying method result')
+assert_equal(#call_log, 1, 'Expected a single spellmaxthresholds invocation')
+assert_equal(call_log[1].self, fake_bot, 'Expected self to be preserved in method call')
+assert_equal(call_log[1].spell_type, 'fastheals', 'Expected enum to normalize to short name')
+assert_equal(call_log[1].threshold, 40, 'Expected threshold to be converted to a number')
+assert_equal(call_log[1].condition, 'spawned-only', 'Expected condition to pass through unchanged')
+
+assert_error(function()
+    SpellEnums.set_spell_max_threshold({}, SpellEnums.SpellTypes.FastHeals, 40, nil)
+end, 'does not implement spellmaxthresholds')
+
+assert_error(function()
+    SpellEnums.set_spell_max_threshold(fake_bot, 'not-a-spell-type', 20, nil)
+end, 'Invalid spell type key')
+
+assert_error(function()
+    SpellEnums.set_spell_max_threshold(fake_bot, SpellEnums.SpellTypes.FastHeals, 'not-a-number', nil)
+end, 'Threshold value for fastheals')
+
 print('[tests] spell_enums: all tests passed')

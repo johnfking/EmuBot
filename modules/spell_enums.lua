@@ -162,5 +162,34 @@ function SpellEnums.normalize_spell_max_thresholds(threshold_map)
     return normalized
 end
 
+---Helper to call a bot's spellmaxthresholds method using enum values.
+---@param bot table|userdata
+---@param spell_type any
+---@param threshold any
+---@param condition any
+---@return any
+function SpellEnums.set_spell_max_threshold(bot, spell_type, threshold, condition)
+    if bot == nil then
+        error('SpellEnums.set_spell_max_threshold: bot instance was nil')
+    end
+
+    local spellmaxthresholds = bot.spellmaxthresholds
+    if type(spellmaxthresholds) ~= 'function' then
+        error('SpellEnums.set_spell_max_threshold: provided bot does not implement spellmaxthresholds')
+    end
+
+    local short, err = SpellEnums.get_short_name(spell_type)
+    if not short then
+        error(string.format('Invalid spell type key (%s): %s', tostring(spell_type), err or 'unknown error'))
+    end
+
+    local numeric_value = tonumber(threshold)
+    if not numeric_value then
+        error(string.format('Threshold value for %s must be numeric, received %s', tostring(short), tostring(threshold)))
+    end
+
+    return bot:spellmaxthresholds(short, numeric_value, condition)
+end
+
 return SpellEnums
 
