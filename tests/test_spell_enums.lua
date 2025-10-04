@@ -60,7 +60,7 @@ assert_truthy(bad_err:find('unrecognized spell type', 1, true), 'Expected error 
 print('[tests] spell_enums: normalizing spell max thresholds')
 local normalized = SpellEnums.normalize_spell_max_thresholds({
     [SpellEnums.SpellTypes.Nuke] = '5',
-    HoTHeals = 12,
+    [SpellEnums.SpellTypes.HoTHeals] = 12,
 })
 assert_equal(normalized.nuke, 5, 'Failed to normalize numeric string value')
 assert_equal(normalized.hotheals, 12, 'Failed to normalize canonical key')
