@@ -17,6 +17,12 @@ M.statusText = ""
 M._meSeeded = false
 -- UI: number of raid groups to display in the layout grid (1-12)
 M.groupsToDisplay = 12
+-- Display preference: show class instead of name
+M.showClassNames = false
+
+function M.set_show_class_names(v)
+    M.showClassNames = v and true or false
+end
 
 -- forward declarations
 local inDesired
@@ -175,6 +181,42 @@ local function unassignedAllBots()
         if not inDesired(name) then table.insert(res, name) end
     end
     return res
+end
+
+-- Class abbreviation helper (mirrors logic from inventory viewer)
+local function get_bot_class_abbrev(name)
+    local meta = bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[name]
+    local cls = meta and meta.Class or nil
+    if not cls or cls == '' then return 'UNK' end
+    local up = tostring(cls):upper()
+    local map = {
+        WAR='WAR', WARRIOR='WAR',
+        CLR='CLR', CLERIC='CLR',
+        PAL='PAL', PALADIN='PAL',
+        RNG='RNG', RANGER='RNG',
+        SHD='SHD', ['SHADOWKNIGHT']='SHD', SHADOWKNIGHT='SHD', SK='SHD',
+        DRU='DRU', DRUID='DRU',
+        MNK='MNK', MONK='MNK',
+        BRD='BRD', BARD='BRD',
+        ROG='ROG', ROGUE='ROG',
+        SHM='SHM', SHAMAN='SHM',
+        NEC='NEC', NECROMANCER='NEC',
+        WIZ='WIZ', WIZARD='WIZ',
+        MAG='MAG', MAGICIAN='MAG',
+        ENC='ENC', ENCHANTER='ENC',
+        BST='BST', BEAST='BST', BEASTLORD='BST', BL='BST',
+        BER='BER', BERSERKER='BER',
+    }
+    if map[up] then return map[up] end
+    for key, val in pairs(map) do if up:find(key) then return val end end
+    return 'UNK'
+end
+
+local function display_label(name)
+    if M.showClassNames then
+        return get_bot_class_abbrev(name)
+    end
+    return name
 end
 
 local function clearLayout()
@@ -503,7 +545,7 @@ function M.draw_tab()
         ImGui.TableHeadersRow()
         for _, n in ipairs(names) do
             ImGui.TableNextRow()
-            ImGui.TableNextColumn(); ImGui.Text(n)
+            ImGui.TableNextColumn(); ImGui.Text(display_label(n))
             ImGui.TableNextColumn(); if ImGui.SmallButton('Load##' .. n) then M.load_layout(n) end
             ImGui.TableNextColumn(); if ImGui.SmallButton('Delete##' .. n) then M.delete_layout(n) end
         end
@@ -559,7 +601,7 @@ function M.draw_tab()
                         ImGui.TableNextColumn()
                         local current = M.desiredLayout[g][slot]
                         if current then
-                            if ImGui.SmallButton(current .. '##rm') then
+                            if ImGui.SmallButton(display_label(current) .. '##rm') then
                                 -- remove: clear this slot (send back to bench)
                                 M.desiredLayout[g][slot] = nil
                             end
@@ -575,7 +617,7 @@ function M.draw_tab()
                                     ImGui.Text('No available bots. Refresh bot list?')
                                 else
                                     for _, n in ipairs(avail) do
-                                        if ImGui.MenuItem(n) then
+                                        if ImGui.MenuItem(display_label(n)) then
                                             M.desiredLayout[g][slot] = n
                                             ImGui.CloseCurrentPopup()
                                         end

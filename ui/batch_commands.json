@@ -1,0 +1,7 @@
+{
+  "groups":{
+    "Melee DPS":["Kogfern","Linranger","Monkster","Raudr","Rhoth","Rogalin","Syrast","Tanlus","Thomanas","Tinuvan"]
+  },
+  "queueDelayMs":75,
+  "selected":"Melee DPS"
+}

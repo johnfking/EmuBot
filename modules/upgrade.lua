@@ -408,14 +408,21 @@ function U.draw_tab()
 
             -- Weapon deltas (colored) - only if weapon
             if isWeapon then
-                local function colortext(delta)
+                -- For weapon Damage: higher is better (green on positive)
+                local function color_damage(delta)
                     if delta > 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, '+' .. tostring(delta))
                     elseif delta < 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(delta))
                     else ImGui.Text('0') end
                 end
+                -- For weapon Delay: LOWER is better, so invert colors
+                local function color_delay(delta)
+                    if delta < 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, tostring(delta))
+                    elseif delta > 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, '+' .. tostring(delta))
+                    else ImGui.Text('0') end
+                end
 
-                ImGui.TableNextColumn(); colortext(dDamage)
-                ImGui.TableNextColumn(); colortext(dDelay)
+                ImGui.TableNextColumn(); color_damage(dDamage)
+                ImGui.TableNextColumn(); color_delay(dDelay)
             end
 
             -- Other deltas (colored)
@@ -642,14 +649,21 @@ function U.draw_compare_window()
 
             -- Weapon Deltas (colored) - only if weapon
             if isWeapon then
-                local function colortext(delta)
+                -- For weapon Damage: higher is better (green on positive)
+                local function color_damage(delta)
                     if delta > 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, '+' .. tostring(delta))
                     elseif delta < 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, tostring(delta))
                     else ImGui.Text('0') end
                 end
+                -- For weapon Delay: LOWER is better, so invert colors
+                local function color_delay(delta)
+                    if delta < 0 then ImGui.TextColored(0.0, 0.9, 0.0, 1.0, tostring(delta))
+                    elseif delta > 0 then ImGui.TextColored(0.9, 0.0, 0.0, 1.0, '+' .. tostring(delta))
+                    else ImGui.Text('0') end
+                end
 
-                ImGui.TableNextColumn(); colortext(dDamage)
-                ImGui.TableNextColumn(); colortext(dDelay)
+                ImGui.TableNextColumn(); color_damage(dDamage)
+                ImGui.TableNextColumn(); color_delay(dDelay)
             end
 
             -- Other Deltas (colored)

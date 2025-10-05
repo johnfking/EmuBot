@@ -8,6 +8,7 @@ local raid_manager = require('EmuBot.modules.raid_manager')
 local upgrade = require('EmuBot.modules.upgrade')
 local db = require('EmuBot.modules.db')
 local commandsui = require('EmuBot.ui.commandsui')
+local bot_controls = require('EmuBot.ui.bot_controls')
 
 -- EmuBot UI style helpers: round all relevant UI elements at radius 8
 local function EmuBot_PushRounding()
@@ -47,6 +48,7 @@ local botUI = {
     botFetchDelay = 1.0,
     botSpawnDelay = 2.0,
     botTargetDelay = 1.0,
+    viewerShowClassInSelector = false,
     selectedBot = nil,
     selectedBotSlotID = nil,
     selectedBotSlotName = nil,
@@ -2525,6 +2527,15 @@ EmuBot_PushRounding()
     if shouldShow then
         local windowWidth = ImGui.GetWindowWidth()
         local botList = collectBotNames()
+        local displayList = {}
+        for _, name in ipairs(botList) do
+            if botUI.viewerShowClassInSelector then
+                local cls = get_bot_class_abbrev(name)
+                table.insert(displayList, cls)
+            else
+                table.insert(displayList, name)
+            end
+        end
         local currentBotName = botUI.selectedBot and botUI.selectedBot.name or ''
         local comboLabel = currentBotName ~= '' and currentBotName or (#botList > 0 and 'Select Bot' or 'No Bots')
 
@@ -2575,7 +2586,7 @@ EmuBot_PushRounding()
             end
 
             -- Use ImGui.Combo and treat index as 1-based
-            local selectedIndex1, changed = ImGui.Combo('##BotInventorySelect', currentIndex1, botList)
+            local selectedIndex1, changed = ImGui.Combo('##BotInventorySelect', currentIndex1, displayList)
             
             -- Process selection when changed
             if changed and selectedIndex1 ~= nil and selectedIndex1 >= 1 and selectedIndex1 <= #botList then
@@ -2598,7 +2609,7 @@ EmuBot_PushRounding()
                     botUI.selectedBotSlotName = nil
                     equippedItems = (botData and botData.equipped) or {}
                     currentBotName = botName
-                    comboLabel = botName
+                    comboLabel = botUI.viewerShowClassInSelector and get_bot_class_abbrev(botName) or botName
                 end
             elseif changed then
                 printf('[EmuBot] Warning: Invalid bot selection index %s (list size: %d)', tostring(selectedIndex1), #botList)
@@ -2824,6 +2835,10 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
             end
 
             if ImGui.BeginTabItem('Raid Manager') then
+                -- Pass viewer display preference to raid manager
+                if raid_manager and raid_manager.set_show_class_names then
+                    raid_manager.set_show_class_names(botUI.viewerShowClassInSelector)
+                end
                 raid_manager.draw_tab()
                 ImGui.EndTabItem()
             end
@@ -2912,6 +2927,15 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                 end
                 if ImGui.IsItemHovered() then
                     ImGui.SetTooltip('Seconds to skip a failed bot before allowing retry')
+                end
+
+                ImGui.Separator()
+                ImGui.Text('Viewer:')
+                ImGui.SameLine()
+                do
+                    local cur = botUI.viewerShowClassInSelector and true or false
+                    local newVal, pressed = ImGui.Checkbox('Show Class in selector instead of Name##viewer_class_toggle', cur)
+                    if pressed then botUI.viewerShowClassInSelector = newVal and true or false end
                 end
                 
                 -- Show skipped bots
@@ -3112,8 +3136,9 @@ local function drawFloatingToggle()
         if ImGui.Button('EB', ImVec2(botUI.floatingButtonSize, botUI.floatingButtonSize)) then
             botUI.showWindow = not botUI.showWindow
         end
+        if ImGui.IsItemClicked(ImGuiMouseButton.Right) then if bot_controls and bot_controls.toggle then bot_controls.toggle() end end
         if ImGui.IsItemHovered() then
-            ImGui.SetTooltip(string.format('Toggle EmuBot (%s)', botUI.showWindow and 'Open' or 'Closed'))
+            ImGui.SetTooltip(string.format('Toggle EmuBot (%s) | Right-click: Bot Controls', botUI.showWindow and 'Open' or 'Closed'))
         end
 
         ImGui.PopStyleVar(1)
@@ -3195,6 +3220,7 @@ function botUI.render()
     -- Draw floating toggles even if main window is closed
     drawFloatingToggle()
     drawUpgradeQuickButton()
+    if bot_controls and bot_controls.draw then bot_controls.draw() end
     -- Draw upgrade comparison overlay window even if tab is not active
     if upgrade and upgrade.draw_compare_window then upgrade.draw_compare_window() end
     
