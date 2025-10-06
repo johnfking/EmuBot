@@ -5,6 +5,9 @@ local mq = require('mq')
 
 -- Lightweight logger for early bootstrap (before module debug is set)
 local function _pm_log(fmt, ...)
+    -- Disabled by default; flip to true for troubleshooting
+    local PM_LOG_ENABLED = false
+    if not PM_LOG_ENABLED then return end
     local msg = string.format(fmt, ...)
     if mq and mq.printf then mq.printf('%s', msg) else print(msg) end
 end
