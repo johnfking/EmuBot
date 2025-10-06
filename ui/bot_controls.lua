@@ -207,6 +207,30 @@ local function _addLearnedSpell(botName, idx, name, id)
     store.updated = os.time()
 end
 
+-- Resolve spell ID from a spell name/link via MQ TLO
+local function _resolveSpellIdByName(name)
+    local id = 0
+    local ok, result = pcall(function()
+        local s = mq.TLO.Spell(tostring(name or ''))
+        if s and s() and s.ID then
+            return tonumber(s.ID()) or 0
+        end
+        return 0
+    end)
+    if ok and result and tonumber(result) then
+        id = tonumber(result)
+    end
+    return id
+end
+
+local function _getServerName()
+    local ok, server = pcall(function()
+        return mq.TLO.EverQuest and mq.TLO.EverQuest.Server and mq.TLO.EverQuest.Server()
+    end)
+    if ok and server then return tostring(server) end
+    return ''
+end
+
 local function _handleSpellsTokens(line, idxToken, spellNameToken, idToken, addToken)
     local botName = M._collectingSpellsForBot
     if not botName or botName == '' then return end
@@ -240,6 +264,42 @@ local function _registerSpellEvents()
     mq.event("BotSpellsSay2", "#1# says 'Spell #2# #*# Spell: #3# (ID: #4#) #*#'", function(line, speaker, idx, name, id)
         _handleSpellsTokens(line, idx, name, id, nil)
     end)
+    
+    -- VEQ2002 format: "Spell 15 | Spell: <name> | Add Spell: Add"
+    -- Very permissive pattern: capture index and name, ignore pipes and trailing text
+    mq.event("BotSpellsVEQ", "#*#Spell #1# #*# Spell: #2# #*#", function(line, idxToken, nameToken)
+        local botName = M._collectingSpellsForBot
+        if not botName or botName == '' then return end
+        local idx = tonumber(tostring(idxToken or ''):match('%d+')) or 0
+        local name = _sanitizeLinkText(nameToken)
+        if name and name ~= '' then
+            -- Resolve ID from MQ TLO by name
+            local id = _resolveSpellIdByName(name)
+            if id > 0 then
+                _addLearnedSpell(botName, idx, name, id)
+                if M._debugSpells then
+                    print(string.format('[BotControls][SpellsEvent-VEQ] bot=%s idx=%d name=%s id=%d', tostring(botName), idx, tostring(name), id))
+                end
+            end
+        end
+    end, { keepLinks = true })
+    
+    -- Fallback minimal format without pipes
+    mq.event("BotSpellsMinimal", "#*#Spell #1# #*# Spell: #2#", function(line, idxToken, nameToken)
+        local botName = M._collectingSpellsForBot
+        if not botName or botName == '' then return end
+        local idx = tonumber(tostring(idxToken or ''):match('%d+')) or 0
+        local name = _sanitizeLinkText(nameToken)
+        if name and name ~= '' then
+            local id = _resolveSpellIdByName(name)
+            if id > 0 then
+                _addLearnedSpell(botName, idx, name, id)
+                if M._debugSpells then
+                    print(string.format('[BotControls][SpellsEvent-Min] bot=%s idx=%d name=%s id=%d', tostring(botName), idx, tostring(name), id))
+                end
+            end
+        end
+    end, { keepLinks = true })
     -- Summary line to mark completion: "{Bot} has {count} AI Spell(s)."
     mq.event("BotSpellsSummary", "#1# has #2# AI Spell#3#.", function(line, bot, count, plural)
         if M._collectingSpellsForBot == bot then
@@ -248,6 +308,14 @@ local function _registerSpellEvents()
             M._collectingSpellsForBot = nil
         end
     end)
+
+    -- Optional: debug catch-all to see unmatched lines (enable via M._debugSpells = true)
+    if M._debugSpells then
+        mq.event("BotSpellsDebug", "#*#Spell:#*#", function(line)
+            print("[BotControls][SpellsDebug] Raw line: " .. tostring(line or ""))
+        end, { keepLinks = true })
+    end
+
     M._spellEventsRegistered = true
     print("[BotControls] Spell events registered")
 end
@@ -258,7 +326,10 @@ local function _unregisterSpellEvents()
     mq.unevent("BotSpellsLineNameId")
     mq.unevent("BotSpellsSay1")
     mq.unevent("BotSpellsSay2")
+    mq.unevent("BotSpellsVEQ")
+    mq.unevent("BotSpellsMinimal")
     mq.unevent("BotSpellsSummary")
+    mq.unevent("BotSpellsDebug")
     M._spellEventsRegistered = false
     print("[BotControls] Spell events unregistered")
 end

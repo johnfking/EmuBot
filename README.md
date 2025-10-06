@@ -24,3 +24,8 @@ Group Management - easily create and spawn/invite a group.  I'm still working on
 
 ![emubot 4](https://github.com/user-attachments/assets/cfdce110-c9d4-4034-82ba-c743ec9de823)
 
+Dependencies
+- EmuBot uses SQLite for persistence via `lsqlite3`.
+- On fresh MacroQuest installs, EmuBot will try to fetch `lsqlite3` automatically using `mq.PackageMan`.
+- If auto-install fails, use your package manager to install `lsqlite3` and reload EmuBot.
+

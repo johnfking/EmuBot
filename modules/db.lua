@@ -2,6 +2,38 @@
 -- SQLite persistence for EmuBot bot data (unique DB per server)
 
 local mq = require('mq')
+
+-- Lightweight logger for early bootstrap (before module debug is set)
+local function _pm_log(fmt, ...)
+    local msg = string.format(fmt, ...)
+    if mq and mq.printf then mq.printf('%s', msg) else print(msg) end
+end
+
+-- Ensure Lua can find packages installed into <luaDir>/modules
+local function _append_unique(list, suffix)
+    if not list or not suffix or suffix == '' then return list end
+    if not string.find(list, suffix, 1, true) then
+        if list == '' then return suffix end
+        return list .. ';' .. suffix
+    end
+    return list
+end
+
+local function _ensure_package_paths()
+    local lua_dir = nil
+    local ok, res = pcall(function()
+        if type(mq.luaDir) == 'function' then return mq.luaDir() end
+        return mq.luaDir
+    end)
+    if ok and res and res ~= '' then lua_dir = tostring(res) end
+    if not lua_dir then return end
+    package.path  = _append_unique(package.path  or '', lua_dir .. '/?.lua')
+    package.path  = _append_unique(package.path  or '', lua_dir .. '/?/init.lua')
+    package.path  = _append_unique(package.path  or '', lua_dir .. '/modules/?.lua')
+    package.cpath = _append_unique(package.cpath or '', lua_dir .. '/modules/?.dll')
+end
+
+_ensure_package_paths()
 local ok_sqlite, sqlite3 = pcall(require, 'lsqlite3')
 
 local M = {}
@@ -204,6 +236,53 @@ local function run_migrations()
 end
 
 function M.init()
+    -- Ensure sqlite dependency at runtime (not during module import)
+    if not ok_sqlite then
+        _pm_log('[EmuBot][DB] lsqlite3 not found. Attempting PackageMan install (runtime)...')
+        local ok_pm, PackageMan = pcall(require, 'mq.PackageMan')
+        if not ok_pm then
+            ok_pm, PackageMan = pcall(require, 'mq/PackageMan')
+        end
+        if ok_pm and PackageMan and type(PackageMan.Require) == 'function' then
+            local ok_install, perr = pcall(function()
+                return PackageMan.Require('lsqlite3')
+            end)
+            if ok_install then
+                _pm_log('[EmuBot][DB] PackageMan.Require("lsqlite3") completed.')
+            else
+                _pm_log('[EmuBot][DB] PackageMan.Require("lsqlite3") failed: %s', tostring(perr))
+            end
+            _ensure_package_paths()
+            -- Diagnostics
+            local lua_dir = nil
+            local ok_ld, res_ld = pcall(function()
+                if type(mq.luaDir) == 'function' then return mq.luaDir() end
+                return mq.luaDir
+            end)
+            if ok_ld and res_ld and res_ld ~= '' then lua_dir = tostring(res_ld) end
+            if lua_dir then
+                _pm_log('[EmuBot][DB] luaDir: %s', lua_dir)
+                local candidate = lua_dir .. '/modules/lsqlite3.dll'
+                local f = io.open(candidate, 'rb')
+                if f then f:close(); _pm_log('[EmuBot][DB] Found candidate: %s', candidate) else _pm_log('[EmuBot][DB] Candidate missing: %s', candidate) end
+            end
+            _pm_log('[EmuBot][DB] package.cpath: %s', tostring(package.cpath))
+            _pm_log('[EmuBot][DB] package.path: %s', tostring(package.path))
+            ok_sqlite, sqlite3 = pcall(require, 'lsqlite3')
+            if ok_sqlite then
+                _pm_log('[EmuBot][DB] Successfully loaded lsqlite3 after install.')
+            else
+                _pm_log('[EmuBot][DB] Still failed to load lsqlite3 after install.')
+            end
+        else
+            _pm_log('[EmuBot][DB] PackageMan not available or missing Require().')
+        end
+    end
+
+    if not ok_sqlite then
+        return false, 'lsqlite3 not available'
+    end
+
     local ok, err = open_db()
     if not ok then return false, err end
     local okddl = exec_ddl()

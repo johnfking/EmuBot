@@ -522,9 +522,8 @@ function botUI.stopScanAllBots()
 end
 
 function botUI._awaitInventoryForBot(botName, shouldCamp)
-    local startTime = os.time()
     local timeout = 15 -- seconds to wait before giving up on this bot
-    local function poll()
+    local function poll(startTime)
         -- If scan was cancelled mid-wait, stop
         if not botUI._scanAllActive then return true end
 
@@ -564,14 +563,14 @@ function botUI._awaitInventoryForBot(botName, shouldCamp)
 
         -- Update UI text while waiting
         botUI._scanAllProgress = string.format('Waiting on %s inventory...', botName)
-        -- Re-enqueue poll after a short delay to avoid blocking
+        -- Re-enqueue poll after a short delay to avoid blocking, preserving original startTime
         enqueueTask(function()
             mq.delay(300) -- Back to faster polling to catch inventory quickly
-            botUI._awaitInventoryForBot(botName, shouldCamp)
+            poll(startTime)
         end)
         return true
     end
-    enqueueTask(poll)
+    enqueueTask(function() poll(os.time()) end)
 end
 
 function botUI._processScanAllBots()
