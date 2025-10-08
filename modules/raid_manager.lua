@@ -15,6 +15,9 @@ M.desiredLayout = {}
 M.includeBench = true
 M.statusText = ""
 M._meSeeded = false
+-- When enabled, treat entries as live PCs (no bot spawn) and
+-- auto-confirm raid invites via ConfirmationDialogBox.
+M.live_pc_mode = false
 -- UI: number of raid groups to display in the layout grid (1-12)
 M.groupsToDisplay = 12
 -- Display preference: show class instead of name
@@ -293,6 +296,10 @@ local function isSpawned(name)
 end
 
 local function spawnIfNeeded(name)
+    if M.live_pc_mode then
+        -- In PC mode, never try to spawn.
+        return true
+    end
     if isSpawned(name) then return true end
     mq.cmdf('/say ^spawn %s', name)
     mq.delay(500, function() return isSpawned(name) end)
@@ -301,6 +308,14 @@ end
 
 local function inviteToRaid(name)
     mq.cmdf('/raidinvite %s', name)
+    if M.live_pc_mode then
+        -- If a confirmation dialog appears, click Yes.
+        mq.delay(500, function() return (mq.TLO.Window('ConfirmationDialogBox') and mq.TLO.Window('ConfirmationDialogBox').Open()) end)
+        if mq.TLO.Window('ConfirmationDialogBox') and mq.TLO.Window('ConfirmationDialogBox').Open() then
+            mq.cmd('/notify ConfirmationDialogBox CD_Yes_Button leftmouseup')
+            mq.delay(150)
+        end
+    end
 end
 
 -- Public actions
@@ -403,6 +418,10 @@ function M.draw_tab()
     if ImGui.Button('Auto-Fill From Selected Groups') then autofill() end
     ImGui.SameLine()
     if ImGui.Button('Clear Layout') then clearLayout() end
+    ImGui.SameLine()
+    local pcMode = M.live_pc_mode and true or false
+    local newPcMode = ImGui.Checkbox('Live PC Mode', pcMode)
+    M.live_pc_mode = newPcMode and true or false
     if M.statusText ~= '' then
         ImGui.SameLine()
         ImGui.TextColored(0.6, 0.9, 0.6, 1.0, M.statusText)
@@ -553,14 +572,28 @@ function M.draw_tab()
     end
 
     ImGui.Separator()
-    if ImGui.Button('Apply Layout To Raid') then
+    if ImGui.Button('Apply') then
         if M._enqueue then M._enqueue(M.applyLayout) else M.applyLayout() end
     end
     ImGui.SameLine()
-    if ImGui.Button('Form Raid (Invite + Arrange)') then
+    if ImGui.Button('Form Raid') then
         if M._enqueue then M._enqueue(M.formRaidFromLayout) else M.formRaidFromLayout() end
     end
-        ImGui.SameLine()
+    ImGui.SameLine()
+    if ImGui.Button('Disband + Camp Bots') then
+        if M._enqueue then
+            M._enqueue(function()
+                mq.cmd('/raiddisband')
+                mq.delay(200)
+                mq.cmd('/say ^botcamp all')
+            end)
+        else
+            mq.cmd('/raiddisband')
+            mq.cmd('/say ^botcamp all')
+        end
+        M.statusText = 'Raid disband + camp all triggered.'
+    end
+    ImGui.SameLine()
     ImGui.Text('# of Groups:')
     ImGui.SameLine()
     -- Dropdown (combo) 1-12 instead of slider (Combo is 1-based)

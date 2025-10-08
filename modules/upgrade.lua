@@ -195,27 +195,80 @@ local function ensure_item_on_cursor(itemID)
     return mq.TLO.Cursor() and tonumber(mq.TLO.Cursor.ID() or 0) == itemID
 end
 
-local function swap_to_bot(botName, itemID, slotID, slotName)
-    -- UI enforces that the cursor already holds the correct item before enabling Swap.
-    -- So we avoid any blocking/delay here.
-    if not mq.TLO.Cursor() or tonumber(mq.TLO.Cursor.ID() or 0) ~= tonumber(itemID or 0) then
-        printf('[EmuBot] Swap requires the upgrade item on your cursor.')
+local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
+    local function printf(fmt, ...) if mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end end
+
+    local function ensure_cursor_empty(timeoutMs)
+        local deadline = os.clock() + (tonumber(timeoutMs or 1500) or 1500)/1000
+        while mq.TLO.Cursor() do
+            mq.cmd('/autoinventory')
+            mq.delay(500)
+            if os.clock() > deadline then return false end
+        end
+        return true
+    end
+
+    local function pick_up_item_by_id_or_name(id, name)
+        -- Prefer exact item ID
+        local fi = (id and tonumber(id) and tonumber(id) > 0) and mq.TLO.FindItem(tonumber(id)) or nil
+        if fi and fi() then
+            local packSlot = tonumber(fi.ItemSlot() or 0) or 0
+            local subSlot = tonumber(fi.ItemSlot2() or -1) or -1
+            if packSlot >= 23 and subSlot >= 0 then
+                mq.cmdf('/itemnotify in pack%i %i leftmouseup', (packSlot - 22), (subSlot + 1))
+                mq.delay(250)
+                return mq.TLO.Cursor() and (tonumber(mq.TLO.Cursor.ID() or 0) == tonumber(id))
+            end
+        end
+        -- Fallback to exact name click
+        if name and name ~= '' then
+            mq.cmdf('/itemnotify "%s" leftmouseup', name)
+            mq.delay(250)
+            if id and tonumber(id) and tonumber(id) > 0 then
+                return mq.TLO.Cursor() and (tonumber(mq.TLO.Cursor.ID() or 0) == tonumber(id))
+            end
+            return mq.TLO.Cursor() ~= nil
+        end
         return false
     end
-    mq.cmdf('/say ^ig byname %s', botName)
 
-    -- Optimistically update cache/DB using cursor data to avoid ^invlist roundtrip
-    local ac, hp, mana = get_cursor_stats()
-    local dmg, dly = get_cursor_weapon_stats()
-    local icon = 0
-    local ok_icon, icon_val = pcall(function()
-        if mq.TLO.Cursor.Icon then return tonumber(mq.TLO.Cursor.Icon() or 0) or 0 end
-        return 0
-    end)
-    if ok_icon and icon_val then icon = icon_val end
-    if bot_inventory and bot_inventory.applySwapFromCursor and slotID ~= nil then
-        bot_inventory.applySwapFromCursor(botName, slotID, slotName, tonumber(itemID) or 0,
-            mq.TLO.Cursor.Name() or 'Item', ac, hp, mana, icon, dmg, dly)
+    local function perform_swap()
+        -- Step 0: make sure cursor is free
+        if not ensure_cursor_empty(1200) then
+            printf('[EmuBot] Could not clear cursor before swap; aborting.')
+            return
+        end
+
+        -- Step 1: instruct bot to clear the requested slot (if specified)
+        if slotID ~= nil and bot_inventory and bot_inventory.requestBotUnequip then
+            bot_inventory.requestBotUnequip(botName, slotID)
+            mq.delay(500)
+        end
+
+        -- Step 2: pick up the upgrade item from our inventory (by ID or exact name)
+        if not pick_up_item_by_id_or_name(itemID, itemName) then
+            printf('[EmuBot] Failed to pick up upgrade item "%s" (ID %s).', tostring(itemName or ''), tostring(itemID or ''))
+            return
+        end
+
+        -- Step 3: give to bot by name
+        mq.cmdf('/say ^ig byname %s', botName)
+        mq.delay(200)
+
+        -- Step 4: if something still on cursor (server/plugin behaviors), auto-inventory it
+        if mq.TLO.Cursor() then
+            mq.cmd('/autoinventory')
+            mq.delay(200)
+        end
+
+        -- Step 5: refresh to reflect actual equip slot
+        U.queue_refresh(botName, 0.8, 3)
+    end
+
+    if type(_G.enqueueTask) == 'function' then
+        _G.enqueueTask(function() perform_swap() end)
+    else
+        perform_swap()
     end
     return true
 end
@@ -438,11 +491,14 @@ function U.draw_tab()
 
             ImGui.TableNextColumn()
             if ImGui.SmallButton('Swap') then
-                local ok = swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0, row.slotid, row.slotname)
+                local ok = swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0, row.slotid, row.slotname, row.itemName)
                 if ok then
                     -- Remove this candidate (assumes single item usage)
                     table.remove(U._candidates, i)
                 end
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Note: Bot decides actual equip slot; weapons often equip to Primary if eligible')
             end
 
             ImGui.PopID()
@@ -635,6 +691,7 @@ function U.draw_compare_window()
                                 mq.ExecuteTextLink(links[1])
                             end
                         end
+                        if ImGui.IsItemHovered() then ImGui.SetTooltip('Click to inspect current item') end
                     else
                         -- Fallback to regular text if no link data available
                         ImGui.Text(curItem.name)
@@ -679,14 +736,15 @@ function U.draw_compare_window()
 
             -- Action (inline)
             ImGui.TableNextColumn()
-            local canSwap = mq.TLO.Cursor() and (tonumber(mq.TLO.Cursor.ID() or 0) == tonumber(row.itemID or 0))
-            if not canSwap then ImGui.BeginDisabled(true) end
             if ImGui.SmallButton('Swap##cmp' .. tostring(i)) then
-                if swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0, row.slotid, row.slotname) then
+                if swap_to_bot(row.bot, tonumber(row.itemID or 0) or 0, row.slotid, row.slotname, row.itemName) then
                     table.remove(U._candidates, i)
                 end
             end
-            if not canSwap then ImGui.EndDisabled() end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Note: Bot decides actual equip slot; weapons often equip to Primary if eligible')
+            end
+            
 
             ImGui.PopID()
         end

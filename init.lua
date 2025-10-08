@@ -98,7 +98,14 @@ local botUI = {
     _originalCampSetting = false, -- Track original camp setting
     -- Auto-scan tracking
     _autoScannedItems = 0, -- Track items auto-scanned due to mismatches,
+    -- Visual tab options
+    showClassInVisual = false,
+    -- Selector options
+    viewerAppendClassAbbrevInSelector = false,
 }
+
+-- Forward declare helpers referenced before their definitions
+local get_bot_class_abbrev
 
 local function drawItemIcon(iconID, width, height)
     width = width or ICON_WIDTH
@@ -1277,6 +1284,13 @@ local function getBotClass(botName)
         return bot_inventory.bot_list_capture_set[botName].Class
     end
     
+    -- Fallback: try to get from live spawn if present
+    local ok, className = pcall(function()
+        local s = mq.TLO.Spawn(string.format('= %s', botName))
+        return s and s.Class and s.Class() or nil
+    end)
+    if ok and className and className ~= '' then return className end
+
     -- If not found, try to get from cached bot list or other sources
     -- This is a fallback - you might need to adapt based on your data structure
     return nil
@@ -1969,14 +1983,24 @@ local function drawVisualTab(equippedItems)
                 end
                 printf('Queued scan for %d slot item(s) in %s', #toScan, slotName or tostring(botUI.selectedBotSlotID))
             end
+            ImGui.SameLine()
+            do
+                local cur = botUI.showClassInVisual and true or false
+                local newVal, pressed = ImGui.Checkbox('Show Class##vis_showclass', cur)
+                if pressed then botUI.showClassInVisual = newVal and true or false end
+            end
             if #slotResults == 0 then
                 ImGui.Text('No bot data available for this slot yet.')
             else
-                if ImGui.BeginTable('BotSlotComparison', 6,
+                local _cols = botUI.showClassInVisual and 7 or 6
+                if ImGui.BeginTable('BotSlotComparison', _cols,
                     ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
                     ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
-                    ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
+                    if botUI.showClassInVisual then
+                        ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 100)
+                    end
                     ImGui.TableSetupColumn('Icon', ImGuiTableColumnFlags.WidthFixed, 48)
+                    ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
                     ImGui.TableSetupColumn('AC', ImGuiTableColumnFlags.WidthFixed, 50)
                     ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 50)
                     ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 50)
@@ -2003,6 +2027,19 @@ local function drawVisualTab(equippedItems)
                             ImGui.SetTooltip('Click to target ' .. (entry.bot or 'bot'))
                         end
 
+                        if botUI.showClassInVisual then
+                            ImGui.TableNextColumn()
+                            local cls = get_bot_class_abbrev(entry.bot)
+                            ImGui.Text(cls or '-')
+                        end
+
+                        ImGui.TableNextColumn()
+                        if entry.item and entry.item.icon and entry.item.icon > 0 then
+                            drawItemIcon(entry.item.icon, 24, 24)
+                        else
+                            ImGui.Text('-')
+                        end
+
                         ImGui.TableNextColumn()
                         if entry.item then
                             local label = (entry.item.name or 'Unknown Item') .. '##' .. (entry.bot or 'unknown')
@@ -2021,13 +2058,6 @@ local function drawVisualTab(equippedItems)
                                 botUI.showLocalCompareWindow = true
                                 printf('[EmuBot] Found %d local items compatible with %s slot', #botUI.localCompareItems, getSlotName(slotId) or 'unknown')
                             end
-                        else
-                            ImGui.Text('-')
-                        end
-
-                        ImGui.TableNextColumn()
-                        if entry.item and entry.item.icon and entry.item.icon > 0 then
-                            drawItemIcon(entry.item.icon, 24, 24)
                         else
                             ImGui.Text('-')
                         end
@@ -2209,8 +2239,8 @@ if ImGui.Button('Scan##' .. tostring(item.slotid or 'unknown')) then
     end
 end
 
--- Helper: Return a 3-letter class abbreviation for a bot, when available
-local function get_bot_class_abbrev(botName)
+ -- Helper: Return a 3-letter class abbreviation for a bot, when available
+get_bot_class_abbrev = function(botName)
     local meta = bot_inventory and bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[botName]
     local cls = meta and meta.Class or nil
     if not cls or cls == '' then return 'UNK' end
@@ -2532,7 +2562,12 @@ EmuBot_PushRounding()
                 local cls = get_bot_class_abbrev(name)
                 table.insert(displayList, cls)
             else
-                table.insert(displayList, name)
+                if botUI.viewerAppendClassAbbrevInSelector then
+                    local cls = get_bot_class_abbrev(name)
+                    table.insert(displayList, string.format('%s [%s]', name, cls))
+                else
+                    table.insert(displayList, name)
+                end
             end
         end
         local currentBotName = botUI.selectedBot and botUI.selectedBot.name or ''
@@ -2608,7 +2643,15 @@ EmuBot_PushRounding()
                     botUI.selectedBotSlotName = nil
                     equippedItems = (botData and botData.equipped) or {}
                     currentBotName = botName
-                    comboLabel = botUI.viewerShowClassInSelector and get_bot_class_abbrev(botName) or botName
+                    if botUI.viewerShowClassInSelector then
+                        comboLabel = get_bot_class_abbrev(botName)
+                    else
+                        if botUI.viewerAppendClassAbbrevInSelector then
+                            comboLabel = string.format('%s [%s]', botName, get_bot_class_abbrev(botName))
+                        else
+                            comboLabel = botName
+                        end
+                    end
                 end
             elseif changed then
                 printf('[EmuBot] Warning: Invalid bot selection index %s (list size: %d)', tostring(selectedIndex1), #botList)
@@ -2933,8 +2976,13 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                 ImGui.SameLine()
                 do
                     local cur = botUI.viewerShowClassInSelector and true or false
-                    local newVal, pressed = ImGui.Checkbox('Show Class in selector instead of Name##viewer_class_toggle', cur)
+                    local newVal, pressed = ImGui.Checkbox('Show class only in selector##viewer_class_toggle', cur)
                     if pressed then botUI.viewerShowClassInSelector = newVal and true or false end
+                end
+                do
+                    local cur = botUI.viewerAppendClassAbbrevInSelector and true or false
+                    local newVal, pressed = ImGui.Checkbox('Append short class to name in selector##viewer_class_append', cur)
+                    if pressed then botUI.viewerAppendClassAbbrevInSelector = newVal and true or false end
                 end
                 
                 -- Show skipped bots
