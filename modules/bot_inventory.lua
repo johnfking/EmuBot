@@ -396,21 +396,49 @@ function BotInventory.parseItemLinkData(itemLinkString)
 end
 
 function BotInventory.getBotListEvent(line, botIndex, botName, level, gender, race, class)
-    --print(string.format("[BotInventory DEBUG] Matched bot: %s, %s, %s, %s, %s, %s", botIndex, botName, level, gender, race, class))
     if not BotInventory.refreshing_bot_list then return end
-    if type(botName) == "table" and botName.text then
-        botName = botName.text
+    -- Normalize name from token or table
+    if type(botName) == "table" and botName.text then botName = botName.text end
+    if not botName or botName == "" then return end
+
+    local s = tostring(line or "")
+    local parsedLevel, tail = s:match("is a Level%s+(%d+)%s+(.+)%s+owned by You%.")
+    if not parsedLevel then
+        parsedLevel, tail = s:match("is a Level%s+(%d+)%s+(.+)%s+owned by You")
     end
+
+    local parsedGender, parsedRace, parsedClass
+    if tail then
+        parsedGender, tail = tail:match("^(%S+)%s+(.+)$")
+        if parsedGender and tail then
+            parsedClass = tail:match("(%S+)$")
+            if parsedClass then
+                parsedRace = tail:sub(1, #tail - #parsedClass - 1)
+                parsedRace = parsedRace and parsedRace:match("^%s*(.-)%s*$") or nil
+            end
+        end
+    end
+    -- Fallbacks to provided tokens if parsing failed
+    parsedLevel = tonumber(parsedLevel) or tonumber(level) or nil
+    parsedGender = parsedGender or gender
+    parsedRace = parsedRace or race
+    parsedClass = parsedClass or class
+
     if not BotInventory.bot_list_capture_set[botName] then
         BotInventory.bot_list_capture_set[botName] = {
             Name = botName,
             Index = tonumber(botIndex),
-            Level = tonumber(level),
-            Gender = gender,
-            Race = race,
-            Class = class
+            Level = parsedLevel,
+            Gender = parsedGender,
+            Race = parsedRace,
+            Class = parsedClass,
         }
-        --print(string.format("[BotInventory DEBUG] Captured bot: %s", botName))
+    else
+        local e = BotInventory.bot_list_capture_set[botName]
+        e.Level = e.Level or parsedLevel
+        e.Gender = e.Gender or parsedGender
+        e.Race = e.Race or parsedRace
+        e.Class = e.Class or parsedClass
     end
 end
 

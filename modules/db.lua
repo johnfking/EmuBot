@@ -44,13 +44,31 @@ M._db = nil
 M._db_path = nil
 M._debug = false
 
+-- Resolve current character (owner) name for scoping
+local function get_owner_name()
+    if mq and mq.TLO and mq.TLO.Me then
+        local ok, name = pcall(function()
+            if mq.TLO.Me.CleanName and mq.TLO.Me.CleanName() then return mq.TLO.Me.CleanName() end
+            if mq.TLO.Me.Name and mq.TLO.Me.Name() then return mq.TLO.Me.Name() end
+            return nil
+        end)
+        if ok and name and name ~= '' then return tostring(name) end
+    end
+    return 'unknown'
+end
+
 function M.set_debug(enabled)
     M._debug = not not enabled
     printf('[EmuBot][DB] Debug logging %s', M._debug and 'ENABLED' or 'DISABLED')
     if M._debug and M._db then
         -- Dump items schema for quick verification
+        printf('[EmuBot][DB] DB Path: %s', tostring(M._db_path))
         printf('[EmuBot][DB] items schema:')
         for row in M._db:nrows("PRAGMA table_info('items');") do
+            printf('  - %s (%s)', tostring(row.name), tostring(row.type))
+        end
+        printf('[EmuBot][DB] bots schema:')
+        for row in M._db:nrows("PRAGMA table_info('bots');") do
             printf('  - %s (%s)', tostring(row.name), tostring(row.type))
         end
     end
@@ -58,8 +76,13 @@ end
 
 local function dump_schema_if_debug()
     if not M._debug or not M._db then return end
+    printf('[EmuBot][DB] DB Path: %s', tostring(M._db_path))
     printf('[EmuBot][DB] items schema:')
     for row in M._db:nrows("PRAGMA table_info('items');") do
+        printf('  - %s (%s)', tostring(row.name), tostring(row.type))
+    end
+    printf('[EmuBot][DB] bots schema:')
+    for row in M._db:nrows("PRAGMA table_info('bots');") do
         printf('  - %s (%s)', tostring(row.name), tostring(row.type))
     end
 end
@@ -156,11 +179,13 @@ local function exec_ddl()
         class TEXT,
         race TEXT,
         gender TEXT,
+        owner TEXT,
         last_updated INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner TEXT,
         bot_name TEXT NOT NULL,
         location TEXT NOT NULL,
         slotid INTEGER,
@@ -189,6 +214,7 @@ local function exec_ddl()
     CREATE INDEX IF NOT EXISTS idx_items_bot ON items(bot_name);
     CREATE INDEX IF NOT EXISTS idx_items_bot_loc ON items(bot_name, location);
     CREATE INDEX IF NOT EXISTS idx_items_slot ON items(slotid);
+    CREATE INDEX IF NOT EXISTS idx_items_owner_bot ON items(owner, bot_name);
 
     CREATE TABLE IF NOT EXISTS bot_groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,6 +262,16 @@ local function run_migrations()
         -- Backfill to 0 for existing rows
         M._db:exec('UPDATE items SET delay = 0 WHERE delay IS NULL;')
     end
+
+    -- Owner scoping support (bots/items)
+    if not column_exists('bots', 'owner') then
+        M._db:exec('ALTER TABLE bots ADD COLUMN owner TEXT;')
+    end
+    if not column_exists('items', 'owner') then
+        M._db:exec('ALTER TABLE items ADD COLUMN owner TEXT;')
+    end
+    -- Ensure index for owner lookups exists
+    M._db:exec('CREATE INDEX IF NOT EXISTS idx_items_owner_bot ON items(owner, bot_name);')
 end
 
 function M.init()
@@ -297,27 +333,60 @@ function M.init()
     return true
 end
 
+-- Expose a manual migration trigger for troubleshooting
+function M.migrate()
+    if not M._db then
+        local ok, err = open_db()
+        if not ok then return false, err end
+    end
+    local okddl = exec_ddl()
+    if not okddl then return false, 'failed to create schema' end
+    run_migrations()
+    dump_schema_if_debug()
+    return true
+end
+
 local function upsert_bot(botName, meta)
-    local stmt = M._db:prepare([[INSERT INTO bots(name, level, class, race, gender, last_updated)
-        VALUES(?,?,?,?,?, strftime('%s','now'))
+    local owner = get_owner_name()
+    local stmt = M._db:prepare([[INSERT INTO bots(name, level, class, race, gender, owner, last_updated)
+        VALUES(?,?,?,?,?,?, strftime('%s','now'))
         ON CONFLICT(name) DO UPDATE SET
             level=excluded.level,
             class=excluded.class,
             race=excluded.race,
             gender=excluded.gender,
+            owner=excluded.owner,
             last_updated=strftime('%s','now')
     ]])
-    if not stmt then return false end
+    if not stmt then
+        -- Retry after running migrations in case owner column is missing
+        run_migrations()
+        stmt = M._db:prepare([[INSERT INTO bots(name, level, class, race, gender, owner, last_updated)
+        VALUES(?,?,?,?,?,?, strftime('%s','now'))
+        ON CONFLICT(name) DO UPDATE SET
+            level=excluded.level,
+            class=excluded.class,
+            race=excluded.race,
+            gender=excluded.gender,
+            owner=excluded.owner,
+            last_updated=strftime('%s','now')
+    ]])
+    end
+    if not stmt then return false, last_error() end
     stmt:bind_values(
         botName,
         meta and meta.Level or nil,
         meta and meta.Class or nil,
         meta and meta.Race or nil,
-        meta and meta.Gender or nil
+        meta and meta.Gender or nil,
+        owner
     )
     local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    local err = not ok and last_error() or nil
     stmt:finalize()
-    return rc == sqlite3.DONE
+    if not ok then return false, err end
+    return true
 end
 
 local function last_error()
@@ -334,7 +403,9 @@ local function insert_item(botName, location, it)
             tostring(it.ac or 'nil'), tostring(it.hp or 'nil'), tostring(it.mana or 'nil'), tostring(it.damage or 'nil'), tostring(it.delay or 'nil'),
             tostring(it.itemlink and #tostring(it.itemlink) or 0), tostring(it.rawline and #tostring(it.rawline) or 0))
     end
+    local owner = get_owner_name()
     local stmt = M._db:prepare([[INSERT INTO items(
+        owner,
         bot_name, location, slotid, slotname, name, itemID, icon, ac, hp, mana,
         itemlink, rawline, qty, nodrop, stackSize, charges,
         aug1Name, aug1link, aug1Icon,
@@ -344,13 +415,30 @@ local function insert_item(botName, location, it)
         aug5Name, aug5link, aug5Icon,
         aug6Name, aug6link, aug6Icon,
         damage, delay
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]])
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]])
+    if not stmt then
+        -- Retry once after ensuring migrations
+        run_migrations()
+        stmt = M._db:prepare([[INSERT INTO items(
+        owner,
+        bot_name, location, slotid, slotname, name, itemID, icon, ac, hp, mana,
+        itemlink, rawline, qty, nodrop, stackSize, charges,
+        aug1Name, aug1link, aug1Icon,
+        aug2Name, aug2link, aug2Icon,
+        aug3Name, aug3link, aug3Icon,
+        aug4Name, aug4link, aug4Icon,
+        aug5Name, aug5link, aug5Icon,
+        aug6Name, aug6link, aug6Icon,
+        damage, delay
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]])
+    end
     if not stmt then
         local err = last_error()
         if M._debug then printf('[EmuBot][DB][insert] prepare failed: %s', tostring(err)) end
         return false, 'prepare failed'
     end
     stmt:bind_values(
+        owner,
         botName, location,
         tonumber(it.slotid), it.slotname, it.name, tonumber(it.itemID), tonumber(it.icon),
         tonumber(it.ac), tonumber(it.hp), tonumber(it.mana),
@@ -384,12 +472,13 @@ function M.save_bot_inventory(botName, data, meta)
         printf('[EmuBot][DB][save] bot=%s equipped=%d', tostring(botName), eqc)
     end
     M._db:exec('BEGIN;')
-    local ok1 = upsert_bot(botName, meta or {})
-    if not ok1 then M._db:exec('ROLLBACK;'); return false, 'upsert bot failed' end
+    local ok1, e1 = upsert_bot(botName, meta or {})
+    if not ok1 then M._db:exec('ROLLBACK;'); return false, 'upsert bot failed: ' .. tostring(e1) end
 
-    -- Replace Equipped items for this bot
-    local del = M._db:prepare('DELETE FROM items WHERE bot_name=? AND location=?')
-    del:bind_values(botName, 'Equipped')
+    -- Replace Equipped items for this bot (scoped by owner)
+    local owner = get_owner_name()
+    local del = M._db:prepare('DELETE FROM items WHERE owner=? AND bot_name=? AND location=?')
+    del:bind_values(owner, botName, 'Equipped')
     del:step()
     del:finalize()
 
@@ -432,12 +521,15 @@ end
 
 function M.load_all()
     if not M._db then return {} end
-    local bots = collect_rows('SELECT name, level, class, race, gender FROM bots', nil)
+    local owner = get_owner_name()
+    local bots = collect_rows('SELECT name, level, class, race, gender FROM bots WHERE owner = ?', function(s)
+        s:bind_values(owner)
+    end)
     local result = {}
     for _, b in ipairs(bots) do
         result[b.name] = { name = b.name, equipped = {}, bags = {}, bank = {} }
-        local items = collect_rows('SELECT * FROM items WHERE bot_name=? AND location=? ORDER BY slotid', function(s)
-            s:bind_values(b.name, 'Equipped')
+        local items = collect_rows('SELECT * FROM items WHERE owner=? AND bot_name=? AND location=? ORDER BY slotid', function(s)
+            s:bind_values(owner, b.name, 'Equipped')
         end)
         for _, r in ipairs(items) do
             table.insert(result[b.name].equipped, {
