@@ -15,9 +15,6 @@ M.desiredLayout = {}
 M.includeBench = true
 M.statusText = ""
 M._meSeeded = false
--- When enabled, treat entries as live PCs (no bot spawn) and
--- auto-confirm raid invites via ConfirmationDialogBox.
-M.live_pc_mode = false
 -- UI: number of raid groups to display in the layout grid (1-12)
 M.groupsToDisplay = 12
 -- Display preference: show class instead of name
@@ -296,10 +293,6 @@ local function isSpawned(name)
 end
 
 local function spawnIfNeeded(name)
-    if M.live_pc_mode then
-        -- In PC mode, never try to spawn.
-        return true
-    end
     if isSpawned(name) then return true end
     mq.cmdf('/say ^spawn %s', name)
     mq.delay(500, function() return isSpawned(name) end)

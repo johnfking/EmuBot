@@ -15,6 +15,7 @@ local M = {}
 local state = {
     show = true,
     showSettings = false,
+    showToggleButton = true,
 }
 
 local config = {
@@ -32,6 +33,7 @@ local config = {
     display = {
         sort_mode = "alphabetical", -- "alphabetical", "raid_group", "class"
         show_class_names = false,
+        show_name_with_class = false, -- Show "Name (Class)" format
         compact_mode = false,
         max_entries = 72, -- Max raid size
         refresh_rate = 1.0, -- Seconds between updates
@@ -43,6 +45,7 @@ local config = {
         mana_width = 60,
         distance_width = 70,
         class_width = 50,
+        name_class_width = 160, -- Width for "Name (Class)" format
         auto_size = true, -- Enable auto-sizing
         min_window_height = 120,
         max_window_height = 800,
@@ -56,6 +59,15 @@ local config = {
         separate_group_windows = false, -- Show each group in its own window
         max_groups_to_show = 6, -- Maximum number of group windows to show (1-12)
         group_window_spacing = 20, -- Vertical spacing between group windows
+    },
+    toggle_button = {
+        enabled = true, -- Show the floating toggle button
+        size = 50, -- Button size (matches EmuBot floating button size)
+        opacity = 0.8, -- Button opacity
+        pos_x = 50, -- Default X position
+        pos_y = 50, -- Default Y position
+        text = "R", -- Button text 
+        lock_position = false, -- Lock button position to prevent dragging
     },
     colors = {
         online = {r=0.9, g=0.9, b=0.9, a=1.0},
@@ -263,10 +275,17 @@ render_member_cells_inline = function(member)
     ImGui.TableNextColumn()
     
     local display_name
-    if config.display.show_class_names then
+    if config.display.show_name_with_class then
+        -- Show "Name (Class)" format
+        local ci = get_class_info(member.class)
+        local class_abbrev = (ci and ci.abbrev) or (member.class or "?")
+        display_name = string.format("%s (%s)", member.name, class_abbrev)
+    elseif config.display.show_class_names then
+        -- Show just class abbreviation
         local ci = get_class_info(member.class)
         display_name = (ci and ci.abbrev) or (member.class or "?")
     else
+        -- Show just name
         display_name = member.name
     end
     
@@ -782,29 +801,70 @@ local function draw_settings_window()
         ImGui.Text('Display Names As:')
         ImGui.SameLine()
         
-        local name_active = not config.display.show_class_names
-        local class_active = config.display.show_class_names
-        
+        local name_active = not config.display.show_class_names and not config.display.show_name_with_class
         if name_active then
             ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.6, 0.2, 0.8)
         end
-        if ImGui.SmallButton('NAM##display') then
+        
+        if ImGui.SmallButton('NAME##display') then
             config.display.show_class_names = false
+            config.display.show_name_with_class = false
         end
+        
         if name_active then
             ImGui.PopStyleColor()
+        end
+        
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Show only character names')
         end
         
         ImGui.SameLine()
+        
+        local class_active = config.display.show_class_names
         if class_active then
             ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.6, 0.2, 0.8)
         end
-        if ImGui.SmallButton('CLS##display') then
-            config.display.show_class_names = true
+        
+        if ImGui.SmallButton('CLASS##display') then
+            config.display.show_class_names = not config.display.show_class_names
+            -- Ensure only one option is active at a time
+            if config.display.show_class_names then
+                config.display.show_name_with_class = false
+            end
         end
+        
         if class_active then
             ImGui.PopStyleColor()
         end
+        
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Show only class abbreviations')
+        end
+        
+        ImGui.SameLine()
+        
+        local name_class_active = config.display.show_name_with_class
+        if name_class_active then
+            ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.6, 0.2, 0.8)
+        end
+        
+        if ImGui.SmallButton('NAME (CLASS)##display') then
+            config.display.show_name_with_class = not config.display.show_name_with_class
+            -- Ensure only one option is active at a time
+            if config.display.show_name_with_class then
+                config.display.show_class_names = false
+            end
+        end
+        
+        if name_class_active then
+            ImGui.PopStyleColor()
+        end
+        
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Show both name and class in "Name (Class)" format')
+        end
+        
         
         ImGui.Spacing()
         
@@ -933,6 +993,56 @@ local function draw_settings_window()
         end
         
         ImGui.Spacing()
+        ImGui.Separator()
+        ImGui.Text('Toggle Button Settings')
+        
+        local toggle_enabled, toggle_enabled_changed = ImGui.Checkbox('Show Toggle Button', config.toggle_button.enabled)
+        if toggle_enabled_changed then
+            config.toggle_button.enabled = toggle_enabled
+            state.showToggleButton = toggle_enabled
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Show a floating button to toggle the raid HUD on/off')
+        end
+        
+        -- Only show toggle button settings if enabled
+        if config.toggle_button.enabled then
+            local button_size, size_changed = ImGui.SliderInt('Button Size', config.toggle_button.size, 20, 80)
+            if size_changed then
+                config.toggle_button.size = button_size
+            end
+            
+            local button_opacity, opacity_changed = ImGui.SliderFloat('Button Opacity', config.toggle_button.opacity, 0.3, 1.0)
+            if opacity_changed then
+                config.toggle_button.opacity = button_opacity
+            end
+            
+            local button_text = tostring(config.toggle_button.text or "RAID")
+            local new_text, text_changed = ImGui.InputTextWithHint('Button Text', 'RAID', button_text, 32)
+            if text_changed then
+                config.toggle_button.text = new_text
+            end
+            
+            local lock_position, lock_changed = ImGui.Checkbox('Lock Button Position', config.toggle_button.lock_position)
+            if lock_changed then
+                config.toggle_button.lock_position = lock_position
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Prevent the button from being dragged to a new position')
+            end
+            
+            if ImGui.Button('Reset Button Position') then
+                config.toggle_button.pos_x = 50
+                config.toggle_button.pos_y = 50
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Move the toggle button back to the default position')
+            end
+        else
+            ImGui.TextColored(0.6, 0.6, 0.6, 1.0, 'Toggle button disabled')
+        end
+        
+        ImGui.Spacing()
         
         -- Auto-size toggle button
         ImGui.Text('Window Sizing:')
@@ -1027,6 +1137,34 @@ local function draw_settings_window()
         if ImGui.IsItemHovered() then
             ImGui.SetTooltip('Extra spacing between member lines')
         end
+        
+        ImGui.Separator()
+        ImGui.Text('Column Width Settings')
+        
+        local name_width, name_width_changed = ImGui.SliderInt('Name Width', config.display.name_width, 80, 200)
+        if name_width_changed then
+            config.display.name_width = name_width
+        end
+        
+        local class_width, class_width_changed = ImGui.SliderInt('Class Width', config.display.class_width, 30, 100)
+        if class_width_changed then
+            config.display.class_width = class_width
+        end
+        
+        local name_class_width, name_class_width_changed = ImGui.SliderInt('Name (Class) Width', config.display.name_class_width, 100, 300)
+        if name_class_width_changed then
+            config.display.name_class_width = name_class_width
+        end
+        
+        local mana_width, mana_width_changed = ImGui.SliderInt('Mana Width', config.display.mana_width, 40, 100)
+        if mana_width_changed then
+            config.display.mana_width = mana_width
+        end
+        
+        local distance_width, distance_width_changed = ImGui.SliderInt('Distance Width', config.display.distance_width, 50, 120)
+        if distance_width_changed then
+            config.display.distance_width = distance_width
+        end
     end
     
     ImGui.Separator()
@@ -1040,6 +1178,115 @@ local function draw_settings_window()
     
     ImGui.End()
     pop_styles()
+end
+
+-- Draw floating toggle button matching EmuBot style
+local function draw_toggle_button()
+    if not state.showToggleButton or not config.toggle_button.enabled then return end
+    
+    -- Set button position
+    ImGui.SetNextWindowPos(config.toggle_button.pos_x, config.toggle_button.pos_y, ImGuiCond.FirstUseEver)
+    
+    -- Set button size (match EmuBot default)
+    local button_size = config.toggle_button.size or 50
+    ImGui.SetNextWindowSize(button_size + 8, button_size + 8, ImGuiCond.FirstUseEver)
+    
+    -- Configure window flags for floating button
+    local flags = bit32.bor(
+        ImGuiWindowFlags.NoTitleBar,
+        ImGuiWindowFlags.NoResize,
+        ImGuiWindowFlags.NoScrollbar,
+        ImGuiWindowFlags.NoScrollWithMouse,
+        ImGuiWindowFlags.NoCollapse,
+        ImGuiWindowFlags.AlwaysAutoResize,
+        ImGuiWindowFlags.NoBackground,
+        ImGuiWindowFlags.NoDecoration
+    )
+    
+    -- Add no move flag if position is locked
+    if config.toggle_button.lock_position then
+        flags = bit32.bor(flags, ImGuiWindowFlags.NoMove)
+    end
+    
+    -- Apply EmuBot floating button styling
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, 4, 4)
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 8)
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 1)
+    
+    -- Apply window background and border colors (EmuBot style)
+    ImGui.PushStyleColor(ImGuiCol.WindowBg, 0.1, 0.1, 0.1, 0.85)
+    ImGui.PushStyleColor(ImGuiCol.Border, 0.4, 0.4, 0.4, 0.8)
+    
+    local isOpen, shouldDraw = ImGui.Begin('##RaidHUDToggle', state.showToggleButton, flags)
+    
+    if not isOpen then
+        state.showToggleButton = false
+        ImGui.End()
+        ImGui.PopStyleColor(2)
+        ImGui.PopStyleVar(3)
+        return
+    end
+    
+    if not shouldDraw then
+        ImGui.End()
+        ImGui.PopStyleColor(2)
+        ImGui.PopStyleVar(3)
+        return
+    end
+    
+    -- Track position as it moves (EmuBot style)
+    if not config.toggle_button.lock_position then
+        local pos_x, pos_y = ImGui.GetWindowPos()
+        config.toggle_button.pos_x = pos_x
+        config.toggle_button.pos_y = pos_y
+    end
+    
+    -- Choose colors based on current raid HUD state (EmuBot style)
+    if state.show then
+        -- Open state: orange-ish (like EmuBot when open)
+        ImGui.PushStyleColor(ImGuiCol.Button, 0.85, 0.55, 0.15, 0.95)
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.95, 0.65, 0.25, 1.0)
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.75, 0.45, 0.10, 1.0)
+    else
+        -- Closed state: green (like EmuBot when closed)
+        ImGui.PushStyleColor(ImGuiCol.Button, 0.2, 0.6, 0.2, 0.9)
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.25, 0.7, 0.25, 1.0)
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.15, 0.5, 0.15, 1.0)
+    end
+    
+    -- Rounded button corners (EmuBot style)
+    ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, math.min(12, button_size * 0.4))
+    
+    -- Create the toggle button (rectangular like EmuBot, not circular)
+    local button_text = config.toggle_button.text or "R"
+    local clicked = ImGui.Button(button_text, button_size, button_size)
+    
+    -- Pop button style (frame rounding)
+    ImGui.PopStyleVar(1)
+    -- Pop button colors  
+    ImGui.PopStyleColor(3)
+    
+    -- Handle button click
+    if clicked then
+        M.toggle()
+    end
+    
+    -- Handle right-click to open settings (like EmuBot does)
+    if ImGui.IsItemClicked(ImGuiMouseButton.Right) then
+        state.showSettings = true
+    end
+    
+    -- Simple tooltip (EmuBot style)
+    if ImGui.IsItemHovered() then
+        local status = state.show and "Open" or "Closed"
+        ImGui.SetTooltip(string.format("Toggle Raid HUD (%s) | Right-click: Settings", status))
+    end
+    
+    ImGui.End()
+    
+    -- Pop window styling (applied at the beginning)
+    ImGui.PopStyleColor(2)  -- Window background and border
+    ImGui.PopStyleVar(3)    -- Window padding, rounding, and border size
 end
 
 -- Draw a single group window
@@ -1136,9 +1383,18 @@ local function draw_group_window(group_number, members)
         end
         
         if ImGui.BeginTable('GroupMembers' .. group_number, columns, table_flags) then
-            -- Setup columns in order: First column (Name/Class), HP%, Mana%, Distance
-            local first_label = config.display.show_class_names and 'Class' or 'Name'
-            local first_width = (config.display.show_class_names and (config.display.class_width or 50)) or (config.display.name_width or 120)
+            -- Setup columns in order: First column (Name/Class/Name(Class)), HP%, Mana%, Distance
+            local first_label, first_width
+            if config.display.show_name_with_class then
+                first_label = 'Name (Class)'
+                first_width = config.display.name_class_width or 160
+            elseif config.display.show_class_names then
+                first_label = 'Class'
+                first_width = config.display.class_width or 50
+            else
+                first_label = 'Name'
+                first_width = config.display.name_width or 120
+            end
             ImGui.TableSetupColumn(first_label, ImGuiTableColumnFlags.WidthFixed, first_width)
             ImGui.TableSetupColumn('HP%', ImGuiTableColumnFlags.WidthFixed, 60)
             if config.display.show_mana then
@@ -1341,9 +1597,20 @@ local function draw_raid_hud()
                 local total_columns = columns_in_row * member_columns
                 if ImGui.BeginTable('RaidMembersMultiColumnRow' .. row_idx, total_columns, table_flags) then
                     -- Setup columns for each position column
-                    local first_col_width = (config.display.show_class_names and (config.display.class_width or 50)) or (config.display.name_width or 120)
+                    local first_col_width, first_base_label
+                    if config.display.show_name_with_class then
+                        first_base_label = 'Name (Class)'
+                        first_col_width = config.display.name_class_width or 160
+                    elseif config.display.show_class_names then
+                        first_base_label = 'Class'
+                        first_col_width = config.display.class_width or 50
+                    else
+                        first_base_label = 'Name'
+                        first_col_width = config.display.name_width or 120
+                    end
+                    
                     for col = 1, columns_in_row do
-                    local first_label = (config.display.show_class_names and 'Class' or 'Name') .. tostring(col)
+                    local first_label = first_base_label .. tostring(col)
                     ImGui.TableSetupColumn(first_label, ImGuiTableColumnFlags.WidthFixed, first_col_width)
                     ImGui.TableSetupColumn('HP%' .. col, ImGuiTableColumnFlags.WidthFixed, 60)
                     if config.display.show_mana then
@@ -1418,9 +1685,18 @@ local function draw_raid_hud()
             end
             
             if ImGui.BeginTable('RaidMembers', columns, table_flags) then
-                -- Setup columns in order: First column (Name/Class), HP%, Mana%, Distance
-                local first_label = config.display.show_class_names and 'Class' or 'Name'
-                local first_width = (config.display.show_class_names and (config.display.class_width or 50)) or (config.display.name_width or 120)
+                -- Setup columns in order: First column (Name/Class/Name(Class)), HP%, Mana%, Distance
+                local first_label, first_width
+                if config.display.show_name_with_class then
+                    first_label = 'Name (Class)'
+                    first_width = config.display.name_class_width or 160
+                elseif config.display.show_class_names then
+                    first_label = 'Class'
+                    first_width = config.display.class_width or 50
+                else
+                    first_label = 'Name'
+                    first_width = config.display.name_width or 120
+                end
                 ImGui.TableSetupColumn(first_label, ImGuiTableColumnFlags.WidthFixed, first_width)
                 ImGui.TableSetupColumn('HP%', ImGuiTableColumnFlags.WidthFixed, 60)
                 if config.display.show_mana then
@@ -1517,7 +1793,7 @@ function M.toggle()
     end
 end
 
--- Register MQ bind: /ebraid show | hide | toggle
+-- Register MQ bind: /ebraid show | hide | toggle | button
 pcall(function()
     if mq and mq.bind then
         mq.bind('/ebraid', function(args)
@@ -1530,8 +1806,16 @@ pcall(function()
                 M.hide()
             elseif sub == 'toggle' or sub == '' then
                 M.toggle()
+            elseif sub == 'button' then
+                M.toggle_button_visibility()
             else
-                if mq and mq.cmd then mq.cmd('/echo Usage: /ebraid [show|hide|toggle]') end
+                if mq and mq.cmd then 
+                    mq.cmd('/echo Usage: /ebraid [show|hide|toggle|button]')
+                    mq.cmd('/echo   show   - Show the raid HUD')
+                    mq.cmd('/echo   hide   - Hide the raid HUD')
+                    mq.cmd('/echo   toggle - Toggle the raid HUD on/off')
+                    mq.cmd('/echo   button - Toggle the floating button on/off')
+                end
             end
         end)
     end
@@ -1553,6 +1837,41 @@ end
 
 function M.toggle_class_names()
     config.display.show_class_names = not config.display.show_class_names
+    -- Ensure only one display mode is active
+    if config.display.show_class_names then
+        config.display.show_name_with_class = false
+    end
+end
+
+function M.toggle_name_with_class()
+    config.display.show_name_with_class = not config.display.show_name_with_class
+    -- Ensure only one display mode is active
+    if config.display.show_name_with_class then
+        config.display.show_class_names = false
+    end
+end
+
+function M.set_name_display_mode(mode)
+    -- mode can be "name", "class", or "name_class"
+    config.display.show_class_names = false
+    config.display.show_name_with_class = false
+    
+    if mode == "class" then
+        config.display.show_class_names = true
+    elseif mode == "name_class" then
+        config.display.show_name_with_class = true
+    end
+    -- Default "name" mode requires no flags to be set
+end
+
+function M.get_name_display_mode()
+    if config.display.show_name_with_class then
+        return "name_class"
+    elseif config.display.show_class_names then
+        return "class"
+    else
+        return "name"
+    end
 end
 
 function M.toggle_auto_size()
@@ -1599,8 +1918,40 @@ function M.get_member_count()
     return count
 end
 
+-- Toggle button API
+function M.show_toggle_button()
+    state.showToggleButton = true
+    config.toggle_button.enabled = true
+end
+
+function M.hide_toggle_button()
+    state.showToggleButton = false
+end
+
+function M.toggle_button_visibility()
+    if state.showToggleButton then
+        M.hide_toggle_button()
+    else
+        M.show_toggle_button()
+    end
+end
+
+function M.is_toggle_button_visible()
+    return state.showToggleButton and config.toggle_button.enabled
+end
+
+function M.set_toggle_button_enabled(enabled)
+    config.toggle_button.enabled = enabled and true or false
+    state.showToggleButton = config.toggle_button.enabled
+end
+
+function M.set_toggle_button_text(text)
+    config.toggle_button.text = tostring(text or "RAID")
+end
+
 -- Main draw function to be called by the ImGui loop
 function M.draw()
+    draw_toggle_button()
     draw_raid_hud()
     draw_settings_window()
     
@@ -1613,6 +1964,8 @@ end
 -- Initialize
 function M.init()
     load_config()
+    -- Ensure toggle button state matches config
+    state.showToggleButton = config.toggle_button.enabled
 end
 
 -- Cleanup

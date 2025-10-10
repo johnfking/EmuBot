@@ -693,11 +693,25 @@ local function draw_hotbar()
             ImGuiWindowFlags.NoCollapse)
     end
     if ImGui.Begin('Bot HotBar##EmuBotHotBar', state.open, flags) then
-        -- Top row: gear icon settings toggle (Font Awesome)
+        -- Top row: gear icon settings toggle (Font Awesome) and raid HUD toggle
         if ImGui.SmallButton(Icons.FA_COG) then
             state.showSettings = not state.showSettings
         end
         if ImGui.IsItemHovered() then ImGui.SetTooltip('Settings') end
+        
+        -- Small 'r' button for raid HUD toggle
+        ImGui.SameLine(0, 3) -- Small spacing between buttons
+        if ImGui.SmallButton(Icons.FA_DOT_CIRCLE_O) then
+            -- Toggle the raid HUD
+            local ok, raid_hud = pcall(require, 'EmuBot.ui.raid_hud')
+            if ok and raid_hud and raid_hud.toggle then
+                raid_hud.toggle()
+            else
+                mq.cmd('/ebraid toggle')
+            end
+        end
+        if ImGui.IsItemHovered() then ImGui.SetTooltip('Toggle Raid HUD (r)') end
+        
         ImGui.Separator()
 
         local W = tonumber(config.buttons.width) or 110
