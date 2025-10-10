@@ -9,6 +9,7 @@ local upgrade = require('EmuBot.modules.upgrade')
 local db = require('EmuBot.modules.db')
 local commandsui = require('EmuBot.ui.commandsui')
 local bot_controls = require('EmuBot.ui.bot_controls')
+local raid_hud = require('EmuBot.ui.raid_hud')
 
 -- EmuBot UI style helpers: round all relevant UI elements at radius 8
 local function EmuBot_PushRounding()
@@ -2985,6 +2986,31 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                     if pressed then botUI.viewerAppendClassAbbrevInSelector = newVal and true or false end
                 end
                 
+                ImGui.Separator()
+                ImGui.Text('UI Components')
+                
+                -- Raid HUD toggle
+                if ImGui.Button('Toggle Raid HUD') then
+                    if raid_hud and raid_hud.toggle then
+                        raid_hud.toggle()
+                    end
+                end
+                if ImGui.IsItemHovered() then
+                    local status = (raid_hud and raid_hud.is_visible and raid_hud.is_visible()) and 'visible' or 'hidden'
+                    ImGui.SetTooltip(string.format('Toggle raid HUD floating window (currently %s)', status))
+                end
+                
+                -- Bot Controls toggle button
+                ImGui.SameLine()
+                if ImGui.Button('Toggle Bot Controls') then
+                    if bot_controls and bot_controls.toggle then
+                        bot_controls.toggle()
+                    end
+                end
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Toggle bot controls window')
+                end
+                
                 -- Show skipped bots
                 local skippedBots = botUI.getSkippedBots()
                 if #skippedBots > 0 then
@@ -3270,6 +3296,8 @@ function botUI.render()
     if bot_controls and bot_controls.draw then bot_controls.draw() end
     -- Draw upgrade comparison overlay window even if tab is not active
     if upgrade and upgrade.draw_compare_window then upgrade.draw_compare_window() end
+    -- Draw raid HUD if enabled
+    if raid_hud and raid_hud.draw then raid_hud.draw() end
     
     botUI.drawBotInventoryWindow()
     
@@ -3338,6 +3366,14 @@ mq.bind("/emubot", function(...)
             else
                 printf('[EmuBot] Invalid slot ID: %s', tostring(args[3]))
             end
+        elseif cmd == 'raidhud' then
+            -- Toggle raid HUD
+            if raid_hud and raid_hud.toggle then
+                raid_hud.toggle()
+                printf('[EmuBot] Raid HUD %s', raid_hud.is_visible() and 'enabled' or 'disabled')
+            else
+                printf('[EmuBot] Raid HUD module not available')
+            end
         elseif cmd == 'help' then
             printf('[EmuBot] Available commands:')
             printf('  /emubot [on|off] - Open/close the UI')
@@ -3346,6 +3382,7 @@ mq.bind("/emubot", function(...)
             printf('  /emubot clearskipped - Clear all skipped bots')
             printf('  /emubot listskipped - Show currently skipped bots')
             printf('  /emubot testslot <itemname> <slotid> [class] - Test item/slot/class compatibility')
+            printf('  /emubot raidhud - Toggle raid HUD')
             printf('  /emubot help - Show this help')
         else
             botUI.showWindow = not botUI.showWindow
@@ -3415,6 +3452,7 @@ local function main()
     if raid_manager and raid_manager.set_enqueue then raid_manager.set_enqueue(enqueueTask) end
     if raid_manager and raid_manager.init then raid_manager.init() end
     if upgrade and upgrade.init then upgrade.init() end
+    if raid_hud and raid_hud.init then raid_hud.init() end
 
     -- Start the Bot HotBar floating UI
     if commandsui and commandsui.start then commandsui.start() end
@@ -3445,7 +3483,24 @@ local function main()
     end
 end
 
-main()
+-- Cleanup function for when script terminates
+local function cleanup()
+    printf('[EmuBot] Shutting down...')
+    if raid_hud and raid_hud.cleanup then raid_hud.cleanup() end
+    if bot_controls and bot_controls.cleanup then bot_controls.cleanup() end
+end
+
+-- Set up cleanup on script termination
+mq.bind('/lua stop EmuBot', cleanup)
+
+local status, result = pcall(main)
+if not status then
+    printf('[EmuBot] Error in main loop: %s', tostring(result))
+    cleanup()
+else
+    cleanup()
+end
+
 -- Expose a simple global toggle to enable DB debug logging from chat:
 -- Usage: /lua eval EmuBotDBDebug(true)  or  /lua eval EmuBotDBDebug(false)
 _G.EmuBotDBDebug = function(enabled)

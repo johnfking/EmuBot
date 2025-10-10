@@ -202,7 +202,7 @@ local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
         local deadline = os.clock() + (tonumber(timeoutMs or 1500) or 1500)/1000
         while mq.TLO.Cursor() do
             mq.cmd('/autoinventory')
-            mq.delay(500)
+            mq.delay(100)
             if os.clock() > deadline then return false end
         end
         return true
@@ -216,14 +216,14 @@ local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
             local subSlot = tonumber(fi.ItemSlot2() or -1) or -1
             if packSlot >= 23 and subSlot >= 0 then
                 mq.cmdf('/itemnotify in pack%i %i leftmouseup', (packSlot - 22), (subSlot + 1))
-                mq.delay(250)
+                mq.delay(500)
                 return mq.TLO.Cursor() and (tonumber(mq.TLO.Cursor.ID() or 0) == tonumber(id))
             end
         end
         -- Fallback to exact name click
         if name and name ~= '' then
             mq.cmdf('/itemnotify "%s" leftmouseup', name)
-            mq.delay(250)
+            mq.delay(500)
             if id and tonumber(id) and tonumber(id) > 0 then
                 return mq.TLO.Cursor() and (tonumber(mq.TLO.Cursor.ID() or 0) == tonumber(id))
             end
@@ -253,12 +253,12 @@ local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
 
         -- Step 3: give to bot by name
         mq.cmdf('/say ^ig byname %s', botName)
-        mq.delay(200)
+        mq.delay(500)
 
         -- Step 4: if something still on cursor (server/plugin behaviors), auto-inventory it
         if mq.TLO.Cursor() then
             mq.cmd('/autoinventory')
-            mq.delay(200)
+            mq.delay(500)
         end
 
         -- Step 5: refresh to reflect actual equip slot
