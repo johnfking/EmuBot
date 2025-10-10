@@ -52,6 +52,10 @@ local config = {
         groups_per_row = 3, -- Number of groups per row (2-6)
         group_spacing = 10, -- Extra horizontal spacing between group columns
         grouping_method = "auto", -- "auto", "position", "eq_groups" - how to assign groups
+        -- Separate group windows options
+        separate_group_windows = false, -- Show each group in its own window
+        max_groups_to_show = 6, -- Maximum number of group windows to show (1-12)
+        group_window_spacing = 20, -- Vertical spacing between group windows
     },
     colors = {
         online = {r=0.9, g=0.9, b=0.9, a=1.0},
@@ -891,6 +895,44 @@ local function draw_settings_window()
         end
         
         ImGui.Spacing()
+        ImGui.Separator()
+        ImGui.Text('Separate Group Windows')
+        
+        local separate_windows, separate_changed = ImGui.Checkbox('Enable Separate Group Windows', config.display.separate_group_windows)
+        if separate_changed then
+            config.display.separate_group_windows = separate_windows
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip('Show each raid group in its own separate window (only works with raid_group sort mode)')
+        end
+        
+        -- Only show separate window settings if enabled
+        if config.display.separate_group_windows then
+            local max_groups, groups_changed = ImGui.SliderInt('Max Groups to Show', config.display.max_groups_to_show, 1, 12)
+            if groups_changed then
+                config.display.max_groups_to_show = max_groups
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Maximum number of group windows to display (1-12)')
+            end
+            
+            local window_spacing, spacing_changed = ImGui.SliderInt('Window Spacing', config.display.group_window_spacing, 5, 50)
+            if spacing_changed then
+                config.display.group_window_spacing = window_spacing
+            end
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip('Vertical spacing multiplier between group windows')
+            end
+            
+            -- Show note about sort mode requirement
+            if config.display.sort_mode ~= "raid_group" then
+                ImGui.TextColored(1.0, 0.6, 0.0, 1.0, 'Note: Requires "Raid Group" sort mode to work')
+            end
+        else
+            ImGui.TextColored(0.6, 0.6, 0.6, 1.0, 'Separate windows disabled - uses single window')
+        end
+        
+        ImGui.Spacing()
         
         -- Auto-size toggle button
         ImGui.Text('Window Sizing:')
@@ -1000,6 +1042,167 @@ local function draw_settings_window()
     pop_styles()
 end
 
+-- Draw a single group window
+local function draw_group_window(group_number, members)
+    local window_name = string.format("Raid Group %d", group_number)
+    
+    -- Calculate window position (stack windows vertically with better spacing)
+    local base_pos_x = 100
+    local spacing_multiplier = math.max(5, config.display.group_window_spacing or 20)
+    local base_pos_y = 100 + (group_number - 1) * spacing_multiplier * 8
+    
+    ImGui.SetNextWindowPos(base_pos_x, base_pos_y, ImGuiCond.FirstUseEver)
+    
+    -- Set window size behavior
+    if config.display.auto_size then
+        -- Use ImGui's natural auto-resize but constrain both width and height
+        ImGui.SetNextWindowSizeConstraints(
+            ImVec2(200, config.display.min_window_height or 120),
+            ImVec2(config.window.width, config.display.max_window_height or 800)
+        )
+        -- Let ImGui auto-size naturally but provide a width hint
+        ImGui.SetNextWindowSize(config.window.width, -1, ImGuiCond.FirstUseEver)
+    else
+        -- Manual sizing - use configured dimensions but adjust height for fewer members
+        local estimated_height = math.min(config.window.height, 80 + #members * 25)
+        ImGui.SetNextWindowSize(config.window.width, estimated_height, ImGuiCond.FirstUseEver)
+    end
+    
+    push_styles()
+    
+    -- Configure window flags based on settings
+    local flags = bit32.bor(
+        ImGuiWindowFlags.AlwaysAutoResize,
+        ImGuiWindowFlags.NoScrollbar,
+        ImGuiWindowFlags.NoScrollWithMouse
+    )
+    
+    -- Add title bar hiding if enabled
+    if config.window.hide_title_bar then
+        flags = bit32.bor(flags, ImGuiWindowFlags.NoTitleBar)
+    end
+    
+    local isOpen, shouldDraw = ImGui.Begin(window_name, true, flags)
+    
+    if not isOpen then
+        ImGui.End()
+        pop_styles()
+        return false -- Signal that this window was closed
+    end
+    
+    if not shouldDraw then
+        ImGui.End()
+        pop_styles()
+        return true -- Keep window open but don't draw
+    end
+    
+    -- Right-click detection for settings anywhere in window
+    if ImGui.IsWindowHovered() and ImGui.IsMouseClicked(ImGuiMouseButton.Right) then
+        state.showSettings = not state.showSettings
+    end
+    
+    -- Show group header and member count
+    if config.window.hide_title_bar then
+        -- Make header more prominent when title bar is hidden
+        ImGui.PushStyleColor(ImGuiCol.Text, config.colors.header.r, config.colors.header.g, config.colors.header.b, config.colors.header.a)
+        ImGui.Text(string.format("Group %d (%d members)", group_number, #members))
+        ImGui.PopStyleColor()
+    else
+        -- Normal header when title bar is visible
+        ImGui.TextColored(config.colors.header.r, config.colors.header.g, config.colors.header.b, config.colors.header.a, 
+                         string.format("Group %d (%d members)", group_number, #members))
+    end
+    
+    if ImGui.IsItemHovered() then
+        ImGui.SetTooltip('Right-click anywhere in window for settings')
+    end
+    
+    ImGui.Separator()
+    
+    -- Member display - use standard single-column layout
+    if #members == 0 then
+        ImGui.Text("No members in this group")
+    else
+        local columns = 2  -- Name and HP% are always shown
+        if config.display.show_mana then columns = columns + 1 end
+        if config.display.show_distance then columns = columns + 1 end
+        local table_flags = bit32.bor(ImGuiTableFlags.Resizable, ImGuiTableFlags.BordersV)
+        
+        -- Apply line spacing if configured, otherwise use compact padding
+        if config.display.line_spacing > 0 then
+            ImGui.PushStyleVar(ImGuiStyleVar.CellPadding, 3, config.display.line_spacing)
+        else
+            ImGui.PushStyleVar(ImGuiStyleVar.CellPadding, 3, 1)
+        end
+        
+        if ImGui.BeginTable('GroupMembers' .. group_number, columns, table_flags) then
+            -- Setup columns in order: First column (Name/Class), HP%, Mana%, Distance
+            local first_label = config.display.show_class_names and 'Class' or 'Name'
+            local first_width = (config.display.show_class_names and (config.display.class_width or 50)) or (config.display.name_width or 120)
+            ImGui.TableSetupColumn(first_label, ImGuiTableColumnFlags.WidthFixed, first_width)
+            ImGui.TableSetupColumn('HP%', ImGuiTableColumnFlags.WidthFixed, 60)
+            if config.display.show_mana then
+                ImGui.TableSetupColumn('Mana%', ImGuiTableColumnFlags.WidthFixed, config.display.mana_width or 60)
+            end
+            if config.display.show_distance then
+                ImGui.TableSetupColumn('Distance', ImGuiTableColumnFlags.WidthFixed, config.display.distance_width or 70)
+            end
+            
+            for _, member in ipairs(members) do
+                render_member_row(member)
+            end
+            
+            ImGui.EndTable()
+        end
+        
+        -- Pop cell padding style
+        ImGui.PopStyleVar(1)
+    end
+    
+    ImGui.End()
+    pop_styles()
+    
+    return true -- Window is still open
+end
+
+-- Draw separate group windows
+local function draw_separate_group_windows(members)
+    -- Ensure configuration is valid
+    local max_groups = math.max(1, math.min(12, config.display.max_groups_to_show or 6))
+    
+    -- Create a position-indexed table of members
+    local members_by_position = {}
+    for _, member in ipairs(members) do
+        if member.raid_position and member.raid_position > 0 then
+            members_by_position[member.raid_position] = member
+        end
+    end
+    
+    -- Group members by their position ranges (1-6 = group 1, 7-12 = group 2, etc.)
+    local groups = {}
+    for pos = 1, max_groups * 6 do
+        local group_number = math.ceil(pos / 6)
+        if group_number <= max_groups then
+            if not groups[group_number] then
+                groups[group_number] = {}
+            end
+            local member = members_by_position[pos]
+            if member then
+                table.insert(groups[group_number], member)
+            end
+        end
+    end
+    
+    -- Draw each group that has members, or show empty groups optionally
+    for group_num = 1, max_groups do
+        local group_members = groups[group_num] or {}
+        -- Only draw windows for groups with members, unless user wants to see empty groups
+        if #group_members > 0 then
+            draw_group_window(group_num, group_members)
+        end
+    end
+end
+
 -- Main HUD window
 local function draw_raid_hud()
     if not state.show then return end
@@ -1009,6 +1212,12 @@ local function draw_raid_hud()
     
     -- Get sorted members
     local members = get_sorted_members()
+    
+    -- Check if we should use separate group windows mode
+    if config.display.separate_group_windows and config.display.sort_mode == "raid_group" then
+        draw_separate_group_windows(members)
+        return
+    end
     
     -- Auto-sizing setup - let ImGui handle the sizing naturally
     
