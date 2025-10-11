@@ -303,10 +303,25 @@ render_member_cells_inline = function(member)
     end
     
     ImGui.TextColored(color.r, color.g, color.b, color.a, display_name)
-    
-    -- If bot is not spawned, allow clicking name to issue spawn command
-    if not member.spawned then
-        if ImGui.IsItemClicked and ImGui.IsItemClicked(ImGuiMouseButton.Left) then
+
+    local leftClicked = ImGui.IsItemClicked and ImGui.IsItemClicked(ImGuiMouseButton.Left)
+    if leftClicked then
+        if member.spawned then
+            local spawnLookup = member.name and string.format('= %s', member.name) or nil
+            local spawn = spawnLookup and mq.TLO.Spawn(spawnLookup) or nil
+            local targetFmt, targetArg
+            if spawn and spawn.ID and spawn.ID() and spawn.ID() > 0 then
+                targetFmt, targetArg = '/target id %d', spawn.ID()
+            else
+                targetFmt, targetArg = '/target "%s"', member.name or ''
+            end
+
+            if mq and mq.cmdf then
+                mq.cmdf(targetFmt, targetArg)
+            elseif mq and mq.cmd then
+                mq.cmd(string.format(targetFmt, targetArg))
+            end
+        else
             if mq and mq.cmdf then
                 mq.cmdf('/say ^spawn %s', member.name)
             elseif mq and mq.cmd then
@@ -315,36 +330,6 @@ render_member_cells_inline = function(member)
             -- Force a quick refresh next frame
             if raid_data then raid_data.last_update = 0 end
         end
-    end
-    
-    -- Tooltip with full info
-    if ImGui.IsItemHovered() then
-        ImGui.BeginTooltip()
-        ImGui.Text(string.format("%s (%s %d)", member.name, member.class, member.level))
-        if member.raid_position then
-            ImGui.Text(string.format("Raid Position: %d (Group %d)", member.raid_position, member.raid_position_group or 1))
-        elseif member.group_number and member.group_number > 0 then
-            ImGui.Text(string.format("Group: %d", member.group_number))
-        end
-        ImGui.Text(string.format("HP: %d/%d (%d%%)", member.current_hp, member.max_hp, member.hp_percent))
-        if member.max_mana > 0 then
-            ImGui.Text(string.format("Mana: %d/%d (%d%%)", member.current_mana, member.max_mana, member.mana_percent))
-        end
-        if member.distance > 0 then
-            ImGui.Text(string.format("Distance: %.0f", member.distance))
-        end
-        if member.zone and member.zone ~= "" then
-            ImGui.Text(string.format("Zone: %s", member.zone))
-        end
-        -- Status indicators
-        if member.dead then
-            ImGui.TextColored(1.0, 0.2, 0.2, 1.0, "DEAD")
-        elseif not member.spawned then
-            ImGui.TextColored(0.9, 0.7, 0.2, 1.0, "NOT SPAWNED")
-        elseif not member.online then
-            ImGui.TextColored(0.9, 0.3, 0.3, 1.0, "OFFLINE")
-        end
-        ImGui.EndTooltip()
     end
     
     -- HP% column with color coding (2nd column)
