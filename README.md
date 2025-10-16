@@ -26,6 +26,21 @@ Group Management - easily create and spawn/invite a group.  I'm still working on
 
 Dependencies
 - EmuBot uses SQLite for persistence via `lsqlite3`.
+
 - On fresh MacroQuest installs, EmuBot will try to fetch `lsqlite3` automatically using `mq.PackageMan`.
 - If auto-install fails, use your package manager to install `lsqlite3` and reload EmuBot.
+
+
+## Testing
+
+EmuBot includes a Lua test harness powered by [busted](https://olivinelabs.com/busted/). The specs use helper mocks to emulate the MacroQuest runtime so the real `mq`/`ImGui` bindings are not required.
+
+1. Install busted (for example with `luarocks install busted`).
+2. From the repository root run:
+
+   ```bash
+   busted
+   ```
+
+Each spec should require `spec.spec_helper`, call `setup_mocks()` before requiring the module under test, and call `reset_mocks()` (typically in a `before_each` hook) to clear shared spy state. The helper registers `spec.support.mock_mq` and `spec.support.mock_imgui` via `package.loaded` and exposes additional utilities for customizing fixtures inside tests.
 
