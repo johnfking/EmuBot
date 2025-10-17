@@ -251,6 +251,20 @@ local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
             return
         end
 
+        -- Capture cursor item stats before handing it off so we can immediately
+        -- reflect the change in the local inventory cache. This keeps the UI
+        -- in sync without waiting for the follow-up ^invlist refresh.
+        local cursorAC, cursorHP, cursorMana = get_cursor_stats()
+        local cursorDmg, cursorDelay = get_cursor_weapon_stats()
+        local cursorIcon = 0
+        local cur = mq.TLO.Cursor
+        if cur and cur() and cur.Icon then
+            local ok, icon = pcall(function() return cur.Icon() end)
+            if ok and icon then
+                cursorIcon = tonumber(icon) or 0
+            end
+        end
+
         -- Step 3: give to bot by name
         mq.cmdf('/say ^ig byname %s', botName)
         mq.delay(500)
@@ -259,6 +273,26 @@ local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
         if mq.TLO.Cursor() then
             mq.cmd('/autoinventory')
             mq.delay(500)
+        end
+
+        -- Step 4b: Immediately apply the swap to the cached bot inventory so
+        -- UI elements (like the slot comparison table) see the new item right
+        -- away. A later ^invlist refresh will correct the data if the bot
+        -- equips it in a different slot than expected.
+        if bot_inventory and bot_inventory.applySwapFromCursor then
+            bot_inventory.applySwapFromCursor(
+                botName,
+                slotID,
+                slotName,
+                itemID,
+                itemName,
+                cursorAC,
+                cursorHP,
+                cursorMana,
+                cursorIcon,
+                cursorDmg,
+                cursorDelay
+            )
         end
 
         -- Step 5: refresh to reflect actual equip slot
