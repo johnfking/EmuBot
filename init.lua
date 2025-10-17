@@ -701,11 +701,14 @@ function botUI._completeScanAllBotStep(botName, shouldCamp)
     if botData and botData.equipped then
         local itemsToScan = {}
         for _, item in ipairs(botData.equipped) do
-            -- Check if item needs scanning (missing stats or has zero stats)
-            local needsScanning = (not item.ac and not item.hp and not item.mana)
-                or ((tonumber(item.ac or 0) == 0) and (tonumber(item.hp or 0) == 0) and (tonumber(item.mana or 0) == 0))
+            local needsScanning
+            if bot_inventory and bot_inventory.ensure_item_cached then
+                needsScanning = bot_inventory.ensure_item_cached(item)
+            else
+                needsScanning = (not item.ac and not item.hp and not item.mana)
+                    or ((tonumber(item.ac or 0) == 0) and (tonumber(item.hp or 0) == 0) and (tonumber(item.mana or 0) == 0))
+            end
 
-            -- If this is a likely weapon slot, also scan when damage/delay are missing
             local sid = tonumber(item.slotid or -1) or -1
             if sid == 11 or sid == 13 or sid == 14 then
                 local dmgZero = (tonumber(item.damage or 0) == 0)
@@ -714,7 +717,9 @@ function botUI._completeScanAllBotStep(botName, shouldCamp)
                     needsScanning = true
                 end
             end
-            
+
+            item.needsScan = needsScanning
+
             if needsScanning and item.itemlink and item.itemlink ~= '' then
                 table.insert(itemsToScan, item)
             end
@@ -965,9 +970,14 @@ local entry = table.remove(botUI._scanQueue, 1)
         attempts = attempts + 1
         local statsCaptured, hasIcon, augCaptured, hasNonZero = tryRead()
         local hasWeaponStats = (tonumber(current.damage or 0) > 0) or (tonumber(current.delay or 0) > 0)
-if statsCaptured and (hasIcon or hasNonZero or hasWeaponStats) then
+        if statsCaptured and (hasIcon or hasNonZero or hasWeaponStats) then
             local w = mq.TLO.Window('ItemDisplayWindow')
             if w() and w.Open() then w.DoClose() end
+
+            if bot_inventory and bot_inventory.update_item_cache then
+                bot_inventory.update_item_cache(current)
+            end
+            current.needsScan = false
 
             -- Persist updated stats for the owning bot, if known
             if not currentBot then
@@ -1012,6 +1022,9 @@ if statsCaptured and (hasIcon or hasNonZero or hasWeaponStats) then
                 -- No stats found, but we at least reset them to zero for consistency.
             end
             -- If we still managed to get any useful stats (weapon or otherwise), persist them
+            if bot_inventory and bot_inventory.update_item_cache then
+                bot_inventory.update_item_cache(current)
+            end
             if currentBot and ((tonumber(current.ac or 0) > 0) or (tonumber(current.hp or 0) > 0) or (tonumber(current.mana or 0) > 0)
                 or (tonumber(current.damage or 0) > 0) or (tonumber(current.delay or 0) > 0)) then
                 local data = bot_inventory.getBotInventory and bot_inventory.getBotInventory(currentBot)
@@ -1034,6 +1047,20 @@ end
 
 function botUI.enqueueItemScan(item, botName)
     if not item or not item.itemlink then return end
+    if bot_inventory and bot_inventory.ensure_item_cached then
+        local needsScan = bot_inventory.ensure_item_cached(item)
+        item.needsScan = needsScan
+        if not needsScan then
+            if botName and bot_inventory.getBotInventory then
+                local data = bot_inventory.getBotInventory(botName)
+                if data then
+                    local meta = bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[botName] or nil
+                    db.save_bot_inventory(botName, data, meta)
+                end
+            end
+            return
+        end
+    end
     table.insert(botUI._scanQueue, { item = item, bot = botName })
     if botUI._scanActive then return end
     botUI._scanActive = true

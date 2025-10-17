@@ -19,6 +19,174 @@ BotInventory.bot_list_capture_set = {}
 BotInventory.invlist_issued_time = nil
 BotInventory._resources_dir = nil
 BotInventory._capture_count = {}
+BotInventory.item_cache_by_id = {}
+
+local CACHEABLE_STAT_FIELDS = {'ac', 'hp', 'mana', 'damage', 'delay'}
+local CACHEABLE_ICON_FIELDS = {'icon', 'iconID'}
+local CACHEABLE_MISC_FIELDS = {'stackSize', 'charges'}
+local CACHEABLE_AUGMENT_FIELDS = {}
+for i = 1, 6 do
+    CACHEABLE_AUGMENT_FIELDS[#CACHEABLE_AUGMENT_FIELDS + 1] = string.format('aug%dName', i)
+    CACHEABLE_AUGMENT_FIELDS[#CACHEABLE_AUGMENT_FIELDS + 1] = string.format('aug%dlink', i)
+    CACHEABLE_AUGMENT_FIELDS[#CACHEABLE_AUGMENT_FIELDS + 1] = string.format('aug%dIcon', i)
+end
+
+local CACHEABLE_FIELDS = {}
+for _, field in ipairs(CACHEABLE_STAT_FIELDS) do CACHEABLE_FIELDS[#CACHEABLE_FIELDS + 1] = field end
+for _, field in ipairs(CACHEABLE_ICON_FIELDS) do CACHEABLE_FIELDS[#CACHEABLE_FIELDS + 1] = field end
+for _, field in ipairs(CACHEABLE_MISC_FIELDS) do CACHEABLE_FIELDS[#CACHEABLE_FIELDS + 1] = field end
+for _, field in ipairs(CACHEABLE_AUGMENT_FIELDS) do CACHEABLE_FIELDS[#CACHEABLE_FIELDS + 1] = field end
+
+local function normalizeItemID(itemID)
+    local numeric = tonumber(itemID)
+    if not numeric or numeric <= 0 then return nil end
+    return numeric
+end
+
+local function isStringEmpty(value)
+    return value == nil or (type(value) == 'string' and value == '')
+end
+
+local function shouldReplaceFromCache(currentValue)
+    if currentValue == nil then return true end
+    if type(currentValue) == 'number' then return currentValue == 0 end
+    if type(currentValue) == 'string' then return currentValue == '' end
+    return false
+end
+
+local function itemHasPrimaryStats(item)
+    if not item then return false end
+    for _, field in ipairs(CACHEABLE_STAT_FIELDS) do
+        local numeric = tonumber(item[field] or 0)
+        if numeric and numeric > 0 then
+            return true
+        end
+    end
+    return false
+end
+
+local function itemHasCacheableData(item)
+    if not item then return false end
+    if itemHasPrimaryStats(item) then return true end
+    for _, field in ipairs(CACHEABLE_ICON_FIELDS) do
+        local numeric = tonumber(item[field] or 0)
+        if numeric and numeric > 0 then return true end
+    end
+    for _, field in ipairs(CACHEABLE_AUGMENT_FIELDS) do
+        if not isStringEmpty(item[field]) then return true end
+    end
+    for _, field in ipairs(CACHEABLE_MISC_FIELDS) do
+        if item[field] ~= nil then return true end
+    end
+    return false
+end
+
+function BotInventory.apply_cached_item_stats(item)
+    local itemID = normalizeItemID(item and item.itemID)
+    if not itemID then return false end
+    local cached = BotInventory.item_cache_by_id[itemID]
+    if not cached then return false end
+
+    local applied = false
+    for _, field in ipairs(CACHEABLE_FIELDS) do
+        local cachedValue = cached[field]
+        if cachedValue ~= nil and shouldReplaceFromCache(item[field]) then
+            item[field] = cachedValue
+            applied = true
+        end
+    end
+
+    if applied then
+        item._cacheMiss = false
+    end
+
+    return applied
+end
+
+function BotInventory.update_item_cache(item)
+    local itemID = normalizeItemID(item and item.itemID)
+    if not itemID or not itemHasCacheableData(item) then return false end
+
+    local entry = BotInventory.item_cache_by_id[itemID] or {}
+    for _, field in ipairs(CACHEABLE_FIELDS) do
+        local value = item[field]
+        if value ~= nil then
+            if type(value) == 'string' then
+                if value ~= '' then entry[field] = value end
+            else
+                entry[field] = value
+            end
+        end
+    end
+    BotInventory.item_cache_by_id[itemID] = entry
+    item._cacheMiss = false
+    return true
+end
+
+function BotInventory.ensure_item_cached(item)
+    if not item then return false end
+
+    local needsScan = false
+    if itemHasPrimaryStats(item) then
+        BotInventory.update_item_cache(item)
+    else
+        local applied = BotInventory.apply_cached_item_stats(item)
+        if not applied or not itemHasPrimaryStats(item) then
+            needsScan = true
+            item._cacheMiss = true
+            if applied and itemHasCacheableData(item) then
+                BotInventory.update_item_cache(item)
+            end
+        else
+            BotInventory.update_item_cache(item)
+        end
+    end
+
+    if not needsScan then
+        item._cacheMiss = false
+    end
+    item.needsScan = needsScan
+    return needsScan
+end
+
+function BotInventory.invalidate_item_cache(itemID)
+    local numeric = normalizeItemID(itemID)
+    if not numeric then return false end
+    if BotInventory.item_cache_by_id[numeric] then
+        BotInventory.item_cache_by_id[numeric] = nil
+        return true
+    end
+    return false
+end
+
+function BotInventory.invalidate_item_cache_if_unused(itemID)
+    local numeric = normalizeItemID(itemID)
+    if not numeric then return false end
+
+    local function collectionHasItem(collection)
+        if type(collection) ~= 'table' then return false end
+        for _, entry in pairs(collection) do
+            if type(entry) == 'table' then
+                if normalizeItemID(entry.itemID) == numeric then
+                    return true
+                end
+                if collectionHasItem(entry) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    for _, data in pairs(BotInventory.bot_inventories or {}) do
+        if collectionHasItem(data.equipped) or collectionHasItem(data.bags) or collectionHasItem(data.bank) then
+            return false
+        end
+    end
+
+    BotInventory.item_cache_by_id[numeric] = nil
+    return true
+end
 
 local function normalizePathSeparators(path)
     return path and path:gsub('\\\\', '/') or nil
@@ -506,6 +674,10 @@ local function displayBotInventory(line, slotNum, slotName)
             end
         end
         if not replaced then table.insert(eq, newItem) end
+
+        local needsScan = BotInventory.ensure_item_cached(newItem)
+        newItem.needsScan = needsScan
+
         -- Count capture lines for this request
         BotInventory._capture_count[botName] = (BotInventory._capture_count[botName] or 0) + 1
 
@@ -716,13 +888,17 @@ local function displayBotUnequipResponse(line, slotNum, itemName)
     print(string.format("[BotInventory] %s unequipped %s from slot %s", botName, itemName or "item", slotNum or "unknown"))
     
     -- Remove the item from our cached inventory if we have it
-if BotInventory.bot_inventories[botName] and BotInventory.bot_inventories[botName].equipped then
+    if BotInventory.bot_inventories[botName] and BotInventory.bot_inventories[botName].equipped then
         local removed = false
         for i = #BotInventory.bot_inventories[botName].equipped, 1, -1 do
             local item = BotInventory.bot_inventories[botName].equipped[i]
             if tonumber(item.slotid) == tonumber(slotNum) then
+                local removedItemID = item.itemID
                 table.remove(BotInventory.bot_inventories[botName].equipped, i)
                 print(string.format("[BotInventory] Removed %s from cached inventory", item.name or "item"))
+                if removedItemID then
+                    BotInventory.invalidate_item_cache_if_unused(removedItemID)
+                end
                 removed = true
                 break
             end
@@ -866,6 +1042,9 @@ function BotInventory.applySwapFromCursor(botName, slotID, slotName, itemID, ite
     end
     if not replaced then table.insert(eq, newItem) end
 
+    local needsScan = BotInventory.ensure_item_cached(newItem)
+    newItem.needsScan = needsScan
+
     -- Persist to DB with available bot meta
     local meta = BotInventory.bot_list_capture_set and BotInventory.bot_list_capture_set[botName] or nil
     local ok, err = db.save_bot_inventory(botName, BotInventory.bot_inventories[botName], meta)
@@ -899,55 +1078,58 @@ function BotInventory.compareInventoryData(botName, oldData, newData)
             newBySlot[tonumber(item.slotid)] = item
         end
     end
-    
+
+    local function statsFullyMissing(item)
+        if not item then return true end
+        local ac = tonumber(item.ac) or 0
+        local hp = tonumber(item.hp) or 0
+        local mana = tonumber(item.mana) or 0
+        local damage = tonumber(item.damage) or 0
+        local delay = tonumber(item.delay) or 0
+        return ac == 0 and hp == 0 and mana == 0 and damage == 0 and delay == 0
+    end
+
     -- Compare items in each slot
     for slotId, newItem in pairs(newBySlot) do
         local oldItem = oldBySlot[slotId]
+        local cacheMiss = BotInventory.ensure_item_cached(newItem)
         local needsScan = false
         local reason = ""
-        
+
         if not oldItem then
-            -- New item in this slot
-            needsScan = (not newItem.ac or tonumber(newItem.ac) == 0) and
-                       (not newItem.hp or tonumber(newItem.hp) == 0) and
-                       (not newItem.mana or tonumber(newItem.mana) == 0) and
-                       (not newItem.damage or tonumber(newItem.damage) == 0) and
-                       (not newItem.delay or tonumber(newItem.delay) == 0)
-            reason = "new item with missing stats"
+            if cacheMiss or statsFullyMissing(newItem) then
+                needsScan = true
+                reason = "new item with missing stats"
+            end
         elseif oldItem.name ~= newItem.name or oldItem.itemID ~= newItem.itemID then
-            -- Different item in the same slot
-            needsScan = (not newItem.ac or tonumber(newItem.ac) == 0) and
-                       (not newItem.hp or tonumber(newItem.hp) == 0) and
-                       (not newItem.mana or tonumber(newItem.mana) == 0) and
-                       (not newItem.damage or tonumber(newItem.damage) == 0) and
-                       (not newItem.delay or tonumber(newItem.delay) == 0)
-            reason = string.format("item changed from '%s' to '%s'", oldItem.name or "unknown", newItem.name or "unknown")
+            if cacheMiss or statsFullyMissing(newItem) then
+                needsScan = true
+                reason = string.format("item changed from '%s' to '%s'", oldItem.name or "unknown", newItem.name or "unknown")
+            end
         else
-            -- Same item, check for stat mismatches
-            local oldAC = tonumber(oldItem.ac) or 0
-            local oldHP = tonumber(oldItem.hp) or 0
-            local oldMana = tonumber(oldItem.mana) or 0
-            local newAC = tonumber(newItem.ac) or 0
-            local newHP = tonumber(newItem.hp) or 0
-            local newMana = tonumber(newItem.mana) or 0
-            
-            -- If old item had stats but new item doesn't, or stats changed significantly
-            local oldDamage = tonumber(oldItem.damage) or 0
-            local oldDelay = tonumber(oldItem.delay) or 0
-            local newDamage = tonumber(newItem.damage) or 0
-            local newDelay = tonumber(newItem.delay) or 0
-            
-            if (oldAC > 0 or oldHP > 0 or oldMana > 0 or oldDamage > 0 or oldDelay > 0) and 
-               (newAC == 0 and newHP == 0 and newMana == 0 and newDamage == 0 and newDelay == 0) then
+            if not statsFullyMissing(oldItem) and statsFullyMissing(newItem) then
                 needsScan = true
                 reason = "stats missing from fresh data"
-            elseif (newAC == 0 and newHP == 0 and newMana == 0 and newDamage == 0 and newDelay == 0) and 
-                   (not newItem.itemlink or newItem.itemlink == "") then
+            elseif (cacheMiss or statsFullyMissing(newItem)) and (not newItem.itemlink or newItem.itemlink == "") then
                 needsScan = true
                 reason = "missing stats and itemlink"
             end
         end
-        
+
+        local slotIsWeapon = slotId == 11 or slotId == 13 or slotId == 14
+        if slotIsWeapon then
+            local damageZero = (tonumber(newItem.damage or 0) == 0)
+            local delayZero = (tonumber(newItem.delay or 0) == 0)
+            if damageZero or delayZero then
+                needsScan = true
+                if reason == "" then
+                    reason = "missing weapon stats"
+                end
+            end
+        end
+
+        newItem.needsScan = needsScan
+
         if needsScan then
             table.insert(mismatches, {
                 item = newItem,
@@ -976,6 +1158,33 @@ function BotInventory.init()
         local loaded = db.load_all() or {}
         for name, data in pairs(loaded) do
             BotInventory.bot_inventories[name] = data
+            if data then
+                if data.equipped then
+                    for _, item in ipairs(data.equipped) do
+                        BotInventory.ensure_item_cached(item)
+                    end
+                end
+                if data.bags then
+                    for _, bag in pairs(data.bags) do
+                        if type(bag) == 'table' then
+                            if bag.itemID or bag.slotid then
+                                BotInventory.ensure_item_cached(bag)
+                            else
+                                for _, bagItem in ipairs(bag) do
+                                    if type(bagItem) == 'table' then
+                                        BotInventory.ensure_item_cached(bagItem)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                if data.bank then
+                    for _, item in ipairs(data.bank) do
+                        BotInventory.ensure_item_cached(item)
+                    end
+                end
+            end
             -- Seed capture set so UI can list bots immediately
             if not BotInventory.bot_list_capture_set[name] then
                 BotInventory.bot_list_capture_set[name] = { Name = name }
