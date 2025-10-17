@@ -1,7 +1,8 @@
 -- emubot/modules/db.lua
 -- SQLite persistence for EmuBot bot data (unique DB per server)
 
-local mq = require('mq')
+local ok_mq, mq = pcall(require, 'mq')
+if not ok_mq then mq = nil end
 
 -- Lightweight logger for early bootstrap (before module debug is set)
 local function _pm_log(fmt, ...)
@@ -23,6 +24,7 @@ local function _append_unique(list, suffix)
 end
 
 local function _ensure_package_paths()
+    if not mq then return end
     local lua_dir = nil
     local ok, res = pcall(function()
         if type(mq.luaDir) == 'function' then return mq.luaDir() end
@@ -43,6 +45,9 @@ local M = {}
 M._db = nil
 M._db_path = nil
 M._debug = false
+M._owner_name_override = nil
+M._owner_name_provider = nil
+M._db_path_override = nil
 
 -- Resolve current character (owner) name for scoping
 local function get_owner_name()
@@ -55,6 +60,36 @@ local function get_owner_name()
         if ok and name and name ~= '' then return tostring(name) end
     end
     return 'unknown'
+end
+
+local function normalize_owner(value)
+    if value == nil then return nil end
+    local owner = tostring(value):match('^%s*(.-)%s*$')
+    if owner == '' then return nil end
+    return owner
+end
+
+local function resolve_owner_from_meta(meta)
+    if not meta then return nil end
+    return normalize_owner(meta.owner or meta.Owner)
+end
+
+local function resolve_owner(meta)
+    if M._owner_name_provider then
+        local ok, owner = pcall(M._owner_name_provider, meta)
+        if ok then
+            owner = normalize_owner(owner)
+            if owner then return owner end
+        end
+    end
+    local from_meta = resolve_owner_from_meta(meta)
+    if from_meta then return from_meta end
+    if M._owner_name_override then return M._owner_name_override end
+    return get_owner_name()
+end
+
+local function printf(fmt, ...)
+    if mq and mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end
 end
 
 function M.set_debug(enabled)
@@ -78,6 +113,26 @@ function M.set_debug(enabled)
     end
 end
 
+function M.set_owner_name(owner)
+    M._owner_name_override = normalize_owner(owner)
+end
+
+function M.set_owner_name_provider(provider)
+    if type(provider) == 'function' then
+        M._owner_name_provider = provider
+    else
+        M._owner_name_provider = nil
+    end
+end
+
+function M.set_database_path(path)
+    if path and path ~= '' then
+        M._db_path_override = tostring(path)
+    else
+        M._db_path_override = nil
+    end
+end
+
 local function dump_schema_if_debug()
     if not M._debug or not M._db then return end
     printf('[EmuBot][DB] DB Path: %s', tostring(M._db_path))
@@ -93,10 +148,6 @@ local function dump_schema_if_debug()
     for row in M._db:nrows("PRAGMA table_info('bots');") do
         printf('  - %s (%s)', tostring(row.name), tostring(row.type))
     end
-end
-
-local function printf(fmt, ...)
-    if mq.printf then mq.printf(fmt, ...) else print(string.format(fmt, ...)) end
 end
 
 local function normalizePathSeparators(path)
@@ -159,10 +210,13 @@ local function open_db()
         printf('[EmuBot][DB] ERROR: lsqlite3 module not found. Please install lsqlite3 for Lua.')
         return false, 'lsqlite3 not available'
     end
-    local resources = detectResourcesDir() or '.'
-    local server = get_server_name()
-    local filename = string.format('emubot_%s.sqlite', server:gsub('[^%w%-_%.]', '_'))
-    local db_path = resources .. '/' .. filename
+    local db_path = M._db_path_override
+    if not db_path or db_path == '' then
+        local resources = detectResourcesDir() or '.'
+        local server = get_server_name()
+        local filename = string.format('emubot_%s.sqlite', server:gsub('[^%w%-_%.]', '_'))
+        db_path = resources .. '/' .. filename
+    end
     ensure_parent_dir_exists(db_path)
 
     local db = sqlite3.open(db_path)
@@ -512,7 +566,7 @@ upsert_item_stats_record = function(item)
         aug6Icon = COALESCE(excluded.aug6Icon, item_stats.aug6Icon),
         damage = COALESCE(excluded.damage, item_stats.damage),
         delay = COALESCE(excluded.delay, item_stats.delay)
-    )]])
+    ]])
     if not stmt then return false, last_error() end
     stmt:bind_values(
         item.name,
@@ -630,8 +684,16 @@ function M.migrate()
     return true
 end
 
-local function upsert_bot(botName, meta)
-    local owner = get_owner_name()
+function M.close()
+    if M._db then
+        M._db:close()
+        M._db = nil
+        M._db_path = nil
+    end
+end
+
+local function upsert_bot(botName, meta, owner)
+    local resolved_owner = normalize_owner(owner) or resolve_owner(meta) or 'unknown'
     local stmt = M._db:prepare([[INSERT INTO bots(name, level, class, race, gender, owner, last_updated)
         VALUES(?,?,?,?,?,?, strftime('%s','now'))
         ON CONFLICT(name) DO UPDATE SET
@@ -663,7 +725,7 @@ local function upsert_bot(botName, meta)
         meta and meta.Class or nil,
         meta and meta.Race or nil,
         meta and meta.Gender or nil,
-        owner
+        resolved_owner
     )
     local rc = stmt:step()
     local ok = (rc == sqlite3.DONE)
@@ -673,7 +735,7 @@ local function upsert_bot(botName, meta)
     return true
 end
 
-local function insert_item(botName, location, it)
+local function insert_item(botName, location, it, owner)
     if not it then return true end
     local itemKey, displayName = derive_item_key_and_display(it.name)
     if not itemKey or not displayName then return true end
@@ -714,9 +776,9 @@ local function insert_item(botName, location, it)
         return false, err_stats
     end
 
-    local owner = get_owner_name()
+    local resolved_owner = normalize_owner(owner) or resolve_owner(nil)
     local ok_link, err_link = insert_bot_item_record({
-        owner = owner,
+        owner = resolved_owner,
         bot_name = botName,
         location = location,
         slotid = tonumber(it.slotid),
@@ -740,19 +802,19 @@ function M.save_bot_inventory(botName, data, meta)
         local eqc = (data.equipped and #data.equipped) or 0
         printf('[EmuBot][DB][save] bot=%s equipped=%d', tostring(botName), eqc)
     end
+    local owner = resolve_owner(meta) or 'unknown'
     M._db:exec('BEGIN;')
-    local ok1, e1 = upsert_bot(botName, meta or {})
+    local ok1, e1 = upsert_bot(botName, meta or {}, owner)
     if not ok1 then M._db:exec('ROLLBACK;'); return false, 'upsert bot failed: ' .. tostring(e1) end
 
     -- Replace Equipped items for this bot (scoped by owner)
-    local owner = get_owner_name()
     local del = M._db:prepare('DELETE FROM bot_items WHERE owner=? AND bot_name=? AND location=?')
     del:bind_values(owner, botName, 'Equipped')
     del:step()
     del:finalize()
 
-for _, it in ipairs((data.equipped) or {}) do
-        local ok, ierr = insert_item(botName, 'Equipped', it)
+    for _, it in ipairs((data.equipped) or {}) do
+        local ok, ierr = insert_item(botName, 'Equipped', it, owner)
         if not ok then M._db:exec('ROLLBACK;'); return false, 'insert item failed: ' .. tostring(ierr) end
     end
 
@@ -790,7 +852,7 @@ end
 
 function M.load_all()
     if not M._db then return {} end
-    local owner = get_owner_name()
+    local owner = resolve_owner(nil) or 'unknown'
     local bots = collect_rows('SELECT name, level, class, race, gender FROM bots WHERE owner = ?', function(s)
         s:bind_values(owner)
     end)
