@@ -200,6 +200,7 @@ local function exec_ddl()
 
     CREATE TABLE IF NOT EXISTS item_stats (
         name TEXT PRIMARY KEY,
+        display_name TEXT,
         itemID INTEGER,
         icon INTEGER,
         ac INTEGER,
@@ -289,14 +290,113 @@ local function sanitize_item_name(name)
     return str
 end
 
+local function derive_item_key_and_display(name)
+    local display = sanitize_item_name(name)
+    if not display then return nil, nil end
+
+    local bytes = {}
+    for i = 1, #display do
+        bytes[#bytes + 1] = string.format('%02X', display:byte(i))
+    end
+    local key = table.concat(bytes)
+    if key == '' then return nil, nil end
+    return key, display
+end
+
+local function decode_item_key(key)
+    if not key or key == '' then return nil end
+    local str = tostring(key)
+    if #str % 2 ~= 0 then return nil end
+    local chars = {}
+    for i = 1, #str, 2 do
+        local byte = tonumber(str:sub(i, i + 1), 16)
+        if not byte then return nil end
+        chars[#chars + 1] = string.char(byte)
+    end
+    return table.concat(chars)
+end
+
 local upsert_item_stats_record
 local insert_bot_item_record
+
+local function migrate_item_name_keys()
+    if not table_exists('item_stats') then return end
+
+    if not column_exists('item_stats', 'display_name') then
+        M._db:exec('ALTER TABLE item_stats ADD COLUMN display_name TEXT;')
+    end
+
+    local rows = {}
+    for row in M._db:nrows('SELECT name, display_name FROM item_stats') do
+        rows[#rows + 1] = {
+            key = row.name and tostring(row.name) or '',
+            display = row.display_name and tostring(row.display_name) or nil,
+        }
+    end
+
+    if #rows == 0 then return end
+
+    local needs_update = false
+    for _, row in ipairs(rows) do
+        local base_display = sanitize_item_name(row.display) or decode_item_key(row.key) or sanitize_item_name(row.key)
+        local new_key, normalized_display = derive_item_key_and_display(base_display)
+        if new_key and normalized_display then
+            if row.key ~= new_key or (row.display or '') ~= normalized_display then
+                needs_update = true
+                break
+            end
+        end
+    end
+
+    if not needs_update then return end
+
+    local update_stats = M._db:prepare('UPDATE item_stats SET name=?, display_name=? WHERE name=?')
+    local update_bot_items = M._db:prepare('UPDATE bot_items SET item_name=? WHERE item_name=?')
+    if not update_stats or not update_bot_items then
+        if update_stats then update_stats:finalize() end
+        if update_bot_items then update_bot_items:finalize() end
+        return
+    end
+
+    local ok = true
+    M._db:exec('BEGIN;')
+    for _, row in ipairs(rows) do
+        if not ok then break end
+        local current_key = row.key or ''
+        local base_display = sanitize_item_name(row.display) or decode_item_key(current_key) or sanitize_item_name(current_key)
+        local new_key, normalized_display = derive_item_key_and_display(base_display)
+        if new_key and normalized_display then
+            if current_key ~= new_key then
+                update_bot_items:reset()
+                update_bot_items:bind_values(new_key, current_key)
+                local rc_bot = update_bot_items:step()
+                if rc_bot ~= sqlite3.DONE then ok = false; break end
+            end
+
+            update_stats:reset()
+            update_stats:bind_values(new_key, normalized_display, current_key)
+            local rc_stats = update_stats:step()
+            if rc_stats ~= sqlite3.DONE then ok = false; break end
+        end
+    end
+
+    if ok then
+        M._db:exec('COMMIT;')
+    else
+        M._db:exec('ROLLBACK;')
+    end
+
+    update_bot_items:finalize()
+    update_stats:finalize()
+end
 
 local function run_migrations()
     -- Owner scoping support (bots)
     if not column_exists('bots', 'owner') then
         M._db:exec('ALTER TABLE bots ADD COLUMN owner TEXT;')
     end
+
+    migrate_item_name_keys()
 
     -- Legacy migration: move denormalized items into normalized tables
     local legacy_items_table = table_exists('items') and column_exists('items', 'bot_name')
@@ -311,10 +411,11 @@ local function run_migrations()
 
         if not has_bot_items then
             for row in M._db:nrows('SELECT * FROM items') do
-                local sanitized = sanitize_item_name(row.name)
-                if sanitized and sanitized ~= '' then
+                local key, display = derive_item_key_and_display(row.name)
+                if key and display then
                     local item_record = {
-                        name = sanitized,
+                        name = key,
+                        display_name = display,
                         itemID = tonumber(row.itemID),
                         icon = tonumber(row.icon),
                         ac = tonumber(row.ac),
@@ -343,7 +444,7 @@ local function run_migrations()
                         location = row.location,
                         slotid = tonumber(row.slotid),
                         slotname = row.slotname,
-                        item_name = sanitized,
+                        item_name = key,
                     })
                 end
             end
@@ -367,8 +468,9 @@ end
 
 upsert_item_stats_record = function(item)
     if not item or not item.name or item.name == '' then return false, 'item name required' end
+    if not item.display_name or item.display_name == '' then return false, 'item display name required' end
     local stmt = M._db:prepare([[INSERT INTO item_stats(
-        name, itemID, icon, ac, hp, mana, itemlink, rawline, qty, stackSize, charges, nodrop,
+        name, display_name, itemID, icon, ac, hp, mana, itemlink, rawline, qty, stackSize, charges, nodrop,
         aug1Name, aug1link, aug1Icon,
         aug2Name, aug2link, aug2Icon,
         aug3Name, aug3link, aug3Icon,
@@ -376,8 +478,9 @@ upsert_item_stats_record = function(item)
         aug5Name, aug5link, aug5Icon,
         aug6Name, aug6link, aug6Icon,
         damage, delay
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(name) DO UPDATE SET
+        display_name = COALESCE(excluded.display_name, item_stats.display_name),
         itemID = COALESCE(excluded.itemID, item_stats.itemID),
         icon = COALESCE(excluded.icon, item_stats.icon),
         ac = COALESCE(excluded.ac, item_stats.ac),
@@ -413,6 +516,7 @@ upsert_item_stats_record = function(item)
     if not stmt then return false, last_error() end
     stmt:bind_values(
         item.name,
+        item.display_name,
         tonumber(item.itemID), tonumber(item.icon), tonumber(item.ac), tonumber(item.hp), tonumber(item.mana),
         item.itemlink, item.rawline, tonumber(item.qty), tonumber(item.stackSize), tonumber(item.charges), tonumber(item.nodrop),
         item.aug1Name, item.aug1link, tonumber(item.aug1Icon),
@@ -571,17 +675,18 @@ end
 
 local function insert_item(botName, location, it)
     if not it then return true end
-    local sanitizedName = sanitize_item_name(it.name)
-    if not sanitizedName then return true end
+    local itemKey, displayName = derive_item_key_and_display(it.name)
+    if not itemKey or not displayName then return true end
     if M._debug then
         printf('[EmuBot][DB][insert] bot=%s loc=%s slot=%s name="%s" itemID=%s ac=%s hp=%s mana=%s dmg=%s dly=%s linkLen=%s rawLen=%s',
-            tostring(botName), tostring(location), tostring(it.slotid), tostring(it.name or ''), tostring(it.itemID or 'nil'),
+            tostring(botName), tostring(location), tostring(it.slotid), tostring(displayName or ''), tostring(it.itemID or 'nil'),
             tostring(it.ac or 'nil'), tostring(it.hp or 'nil'), tostring(it.mana or 'nil'), tostring(it.damage or 'nil'), tostring(it.delay or 'nil'),
             tostring(it.itemlink and #tostring(it.itemlink) or 0), tostring(it.rawline and #tostring(it.rawline) or 0))
     end
 
     local stats_item = {
-        name = sanitizedName,
+        name = itemKey,
+        display_name = displayName,
         itemID = it.itemID,
         icon = it.icon,
         ac = it.ac,
@@ -616,7 +721,7 @@ local function insert_item(botName, location, it)
         location = location,
         slotid = tonumber(it.slotid),
         slotname = it.slotname,
-        item_name = sanitizedName,
+        item_name = itemKey,
     })
 
     if not ok_link then
@@ -696,7 +801,8 @@ function M.load_all()
             bi.slotid,
             bi.slotname,
             bi.item_name,
-            stats.name AS stats_name,
+            stats.name AS stats_key,
+            stats.display_name AS stats_display_name,
             stats.itemID,
             stats.icon,
             stats.ac,
@@ -723,8 +829,14 @@ function M.load_all()
             s:bind_values(owner, b.name, 'Equipped')
         end)
         for _, r in ipairs(items) do
+            local resolvedName = r.stats_display_name
+                or decode_item_key(r.stats_key)
+                or decode_item_key(r.item_name)
+                or sanitize_item_name(r.stats_key)
+                or sanitize_item_name(r.item_name)
+                or 'Unknown Item'
             table.insert(result[b.name].equipped, {
-                name = r.item_name or r.stats_name,
+                name = resolvedName,
                 slotid = tonumber(r.slotid),
                 slotname = r.slotname,
                 itemlink = r.itemlink,
