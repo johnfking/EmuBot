@@ -115,6 +115,41 @@ local function add_candidate(c)
     U._candidates[#U._candidates + 1] = c
 end
 
+local function find_open_bag_slot()
+    if not mq.TLO.Me or not mq.TLO.Me.Inventory then return nil, nil end
+    for invSlot = 23, 34 do
+        local bag = mq.TLO.Me.Inventory(invSlot)
+        if bag() then
+            local containerSlots = tonumber(bag.Container() or 0) or 0
+            if containerSlots > 0 then
+                local bagIndex = invSlot - 22
+                for slot = 1, containerSlots do
+                    local bagItem = bag.Item(slot)
+                    if not (bagItem and bagItem()) then
+                        return bagIndex, slot
+                    end
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function stash_cursor_item_in_bag()
+    if not mq.TLO.Cursor() then return true end
+    local bagIndex, slotIndex = find_open_bag_slot()
+    if not bagIndex or not slotIndex then
+        printf('[EmuBot] No free bag slot available to store cursor item. Leaving it on the cursor.')
+        return false
+    end
+    mq.cmdf('/itemnotify in pack%i %i leftmouseup', bagIndex, slotIndex)
+    mq.delay(200)
+    if mq.TLO.Cursor() then
+        mq.delay(100)
+    end
+    return mq.TLO.Cursor() == nil
+end
+
 -- Queue a timed inventory refresh for a bot (non-blocking); retries spaced by delaySec
 function U.queue_refresh(botName, delaySec, retries)
     if not botName or botName == '' then return end
@@ -172,9 +207,10 @@ local function ensure_item_on_cursor(itemID)
     if mq.TLO.Cursor() then
         local cid = tonumber(mq.TLO.Cursor.ID() or 0) or 0
         if cid == itemID then return true end
-        -- Try to autoinventory to free cursor
-        mq.cmd('/autoinventory')
-        mq.delay(200)
+        -- Store whatever is currently on the cursor so we can pick up the requested item.
+        if not stash_cursor_item_in_bag() then
+            return false
+        end
     end
     -- Find item in inventory
     local fi = mq.TLO.FindItem(itemID)
@@ -201,8 +237,9 @@ local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
     local function ensure_cursor_empty(timeoutMs)
         local deadline = os.clock() + (tonumber(timeoutMs or 1500) or 1500)/1000
         while mq.TLO.Cursor() do
-            mq.cmd('/autoinventory')
-            mq.delay(100)
+            if not stash_cursor_item_in_bag() then
+                return false
+            end
             if os.clock() > deadline then return false end
         end
         return true
@@ -251,14 +288,49 @@ local function swap_to_bot(botName, itemID, slotID, slotName, itemName)
             return
         end
 
+        -- Capture cursor item stats before handing it off so we can immediately
+        -- reflect the change in the local inventory cache. This keeps the UI
+        -- in sync without waiting for the follow-up ^invlist refresh.
+        local cursorAC, cursorHP, cursorMana = get_cursor_stats()
+        local cursorDmg, cursorDelay = get_cursor_weapon_stats()
+        local cursorIcon = 0
+        local cur = mq.TLO.Cursor
+        if cur and cur() and cur.Icon then
+            local ok, icon = pcall(function() return cur.Icon() end)
+            if ok and icon then
+                cursorIcon = tonumber(icon) or 0
+            end
+        end
+
         -- Step 3: give to bot by name
         mq.cmdf('/say ^ig byname %s', botName)
         mq.delay(500)
 
-        -- Step 4: if something still on cursor (server/plugin behaviors), auto-inventory it
+        -- Step 4: if something still on cursor (server/plugin behaviors), stash it in an open bag slot
         if mq.TLO.Cursor() then
-            mq.cmd('/autoinventory')
-            mq.delay(500)
+            if not stash_cursor_item_in_bag() then
+                printf('[EmuBot] Cursor item could not be stored after handing off upgrade.')
+            end
+        end
+
+        -- Step 4b: Immediately apply the swap to the cached bot inventory so
+        -- UI elements (like the slot comparison table) see the new item right
+        -- away. A later ^invlist refresh will correct the data if the bot
+        -- equips it in a different slot than expected.
+        if bot_inventory and bot_inventory.applySwapFromCursor then
+            bot_inventory.applySwapFromCursor(
+                botName,
+                slotID,
+                slotName,
+                itemID,
+                itemName,
+                cursorAC,
+                cursorHP,
+                cursorMana,
+                cursorIcon,
+                cursorDmg,
+                cursorDelay
+            )
         end
 
         -- Step 5: refresh to reflect actual equip slot
