@@ -3401,6 +3401,21 @@ mq.bind("/emubot", function(...)
             else
                 printf('[EmuBot] Raid HUD module not available')
             end
+        elseif cmd == 'invdebug' or cmd == 'inventorydebug' then
+            if bot_inventory and bot_inventory.set_debug then
+                local arg = args[2] and tostring(args[2]):lower() or nil
+                local enabled
+                if arg == 'on' or arg == 'true' or arg == '1' then
+                    enabled = true
+                elseif arg == 'off' or arg == 'false' or arg == '0' then
+                    enabled = false
+                else
+                    enabled = not (bot_inventory.is_debug_enabled and bot_inventory.is_debug_enabled())
+                end
+                bot_inventory.set_debug(enabled)
+            else
+                printf('[EmuBot] Bot inventory debug toggle unavailable')
+            end
         elseif cmd == 'help' then
             printf('[EmuBot] Available commands:')
             printf('  /emubot [on|off] - Open/close the UI')
@@ -3410,6 +3425,7 @@ mq.bind("/emubot", function(...)
             printf('  /emubot listskipped - Show currently skipped bots')
             printf('  /emubot testslot <itemname> <slotid> [class] - Test item/slot/class compatibility')
             printf('  /emubot raidhud - Toggle raid HUD')
+            printf('  /emubot invdebug [on|off] - Toggle bot inventory debug logging')
             printf('  /emubot help - Show this help')
         else
             botUI.showWindow = not botUI.showWindow
@@ -3532,4 +3548,16 @@ end
 -- Usage: /lua eval EmuBotDBDebug(true)  or  /lua eval EmuBotDBDebug(false)
 _G.EmuBotDBDebug = function(enabled)
     if db and db.set_debug then db.set_debug(enabled) end
+end
+
+-- Expose a global toggle for bot inventory debug logging:
+-- Usage: /lua eval EmuBotInventoryDebug(true|false) -- omit argument to toggle
+_G.EmuBotInventoryDebug = function(enabled)
+    if not bot_inventory or not bot_inventory.set_debug then return end
+    if enabled == nil then
+        local current = bot_inventory.is_debug_enabled and bot_inventory.is_debug_enabled()
+        bot_inventory.set_debug(not current)
+    else
+        bot_inventory.set_debug(enabled)
+    end
 end
