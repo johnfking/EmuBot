@@ -179,6 +179,13 @@ local function open_db()
     return true
 end
 
+local function last_error()
+    if M._db and M._db.errmsg then
+        return M._db:errmsg()
+    end
+    return 'unknown sqlite error'
+end
+
 local function exec_ddl()
     local ddl = [[
     CREATE TABLE IF NOT EXISTS bots (
@@ -560,13 +567,6 @@ local function upsert_bot(botName, meta)
     stmt:finalize()
     if not ok then return false, err end
     return true
-end
-
-local function last_error()
-    if M._db and M._db.errmsg then
-        return M._db:errmsg()
-    end
-    return 'unknown sqlite error'
 end
 
 local function insert_item(botName, location, it)
