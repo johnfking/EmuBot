@@ -3,6 +3,14 @@ local mq = require("mq")
 local json = require("dkjson")
 local db = require('EmuBot.modules.db')
 
+local function printf(fmt, ...)
+    if mq and mq.printf then
+        mq.printf(fmt, ...)
+    else
+        print(string.format(fmt, ...))
+    end
+end
+
 local BotInventory = {}
 BotInventory.bot_inventories = {}
 BotInventory.pending_requests = {}
@@ -20,6 +28,22 @@ BotInventory.invlist_issued_time = nil
 BotInventory._resources_dir = nil
 BotInventory._capture_count = {}
 BotInventory.item_cache_by_id = {}
+BotInventory._debug = false
+
+local function debugPrintf(fmt, ...)
+    if not BotInventory._debug then return end
+    printf('[BotInventory][Debug] ' .. fmt, ...)
+end
+
+function BotInventory.set_debug(enabled)
+    BotInventory._debug = not not enabled
+    printf('[BotInventory][Debug] Debug logging %s', BotInventory._debug and 'ENABLED' or 'DISABLED')
+    return BotInventory._debug
+end
+
+function BotInventory.is_debug_enabled()
+    return BotInventory._debug
+end
 
 local CACHEABLE_STAT_FIELDS = {'ac', 'hp', 'mana', 'damage', 'delay'}
 local CACHEABLE_ICON_FIELDS = {'icon', 'iconID'}
@@ -127,18 +151,25 @@ function BotInventory.ensure_item_cached(item)
     if not item then return false end
 
     local needsScan = false
-    if itemHasPrimaryStats(item) then
-        BotInventory.update_item_cache(item)
+    local hadStatsInitially = itemHasPrimaryStats(item)
+    local hadCacheableInitially = itemHasCacheableData(item)
+    local appliedFromCache = false
+    local cacheUpdated = false
+
+    if hadStatsInitially then
+        cacheUpdated = BotInventory.update_item_cache(item) or cacheUpdated
     else
         local applied = BotInventory.apply_cached_item_stats(item)
-        if not applied or not itemHasPrimaryStats(item) then
+        appliedFromCache = applied
+        local hasStatsAfterCache = itemHasPrimaryStats(item)
+        if not applied or not hasStatsAfterCache then
             needsScan = true
             item._cacheMiss = true
             if applied and itemHasCacheableData(item) then
-                BotInventory.update_item_cache(item)
+                cacheUpdated = BotInventory.update_item_cache(item) or cacheUpdated
             end
         else
-            BotInventory.update_item_cache(item)
+            cacheUpdated = BotInventory.update_item_cache(item) or cacheUpdated
         end
     end
 
@@ -146,6 +177,24 @@ function BotInventory.ensure_item_cached(item)
         item._cacheMiss = false
     end
     item.needsScan = needsScan
+    local linkPresent = not isStringEmpty(item.itemlink) or not isStringEmpty(item.rawline)
+    local hasStatsFinal = itemHasPrimaryStats(item)
+    local hasCacheableFinal = itemHasCacheableData(item)
+
+    debugPrintf(
+        'Cache check for %s (ID=%s, link=%s): stats %s→%s, cacheable %s→%s, cache hit=%s, cache updated=%s, needsScan=%s, cacheMiss=%s',
+        tostring(item.name or 'unknown'),
+        tostring(item.itemID or 'nil'),
+        linkPresent and 'yes' or 'no',
+        hadStatsInitially and 'yes' or 'no',
+        hasStatsFinal and 'yes' or 'no',
+        hadCacheableInitially and 'yes' or 'no',
+        hasCacheableFinal and 'yes' or 'no',
+        appliedFromCache and 'yes' or 'no',
+        cacheUpdated and 'yes' or 'no',
+        needsScan and 'yes' or 'no',
+        (item._cacheMiss and 'yes' or 'no')
+    )
     return needsScan
 end
 
@@ -625,6 +674,14 @@ local function displayBotInventory(line, slotNum, slotName)
     
     local itemlink = (mq.ExtractLinks(line) or {})[1] or { text = "Empty", link = "N/A" }
 
+    debugPrintf(
+        'Received inventory line for %s slot %s: text="%s", link="%s"',
+        botName,
+        tostring(slotName or slotNum),
+        tostring(itemlink.text or 'nil'),
+        tostring(itemlink.link or 'nil')
+    )
+
     if not BotInventory.bot_inventories[botName] then
         BotInventory.bot_inventories[botName] = {
             name = botName,
@@ -633,10 +690,23 @@ local function displayBotInventory(line, slotNum, slotName)
             bank = {}
         }
     end
-    
+
     if itemlink.text ~= "Empty" and itemlink.link ~= "N/A" then
         local parsedItem = BotInventory.parseItemLinkData(line)
-        
+
+        debugPrintf(
+            'Parsed link for %s slot %s: itemID=%s, icon=%s, ac=%s, hp=%s, mana=%s, damage=%s, delay=%s',
+            botName,
+            tostring(slotName or slotNum),
+            parsedItem and tostring(parsedItem.itemID) or 'nil',
+            parsedItem and tostring(parsedItem.iconID or parsedItem.icon) or '0',
+            parsedItem and tostring(parsedItem.ac) or 'nil',
+            parsedItem and tostring(parsedItem.hp) or 'nil',
+            parsedItem and tostring(parsedItem.mana) or 'nil',
+            parsedItem and tostring(parsedItem.damage) or 'nil',
+            parsedItem and tostring(parsedItem.delay) or 'nil'
+        )
+
         local newItem = {
             name = itemlink.text,
             slotid = tonumber(slotNum),
@@ -678,16 +748,31 @@ local function displayBotInventory(line, slotNum, slotName)
         local needsScan = BotInventory.ensure_item_cached(newItem)
         newItem.needsScan = needsScan
 
+        debugPrintf(
+            'Post-processing state for %s slot %s: needsScan=%s, cacheMiss=%s',
+            botName,
+            tostring(slotName or slotNum),
+            needsScan and 'yes' or 'no',
+            newItem._cacheMiss and 'yes' or 'no'
+        )
+
         -- Count capture lines for this request
         BotInventory._capture_count[botName] = (BotInventory._capture_count[botName] or 0) + 1
 
         -- Debug output to track inventory storage (disabled to reduce spam)
-        -- print(string.format("[BotInventory DEBUG] Stored item: %s (ID: %s, Icon: %s) in slot %s for bot %s", 
-        --     item.name, 
-        --     item.itemID or "N/A", 
-        --     item.icon or "N/A", 
-        --     slotName, 
+        -- print(string.format("[BotInventory DEBUG] Stored item: %s (ID: %s, Icon: %s) in slot %s for bot %s",
+        --     item.name,
+        --     item.itemID or "N/A",
+        --     item.icon or "N/A",
+        --     slotName,
         --     botName))
+    else
+        debugPrintf(
+            'Slot %s for %s is empty. Raw line: %s',
+            tostring(slotName or slotNum),
+            botName,
+            tostring(line or '')
+        )
     end
 end
 
