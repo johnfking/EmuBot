@@ -63,8 +63,12 @@ function M.set_debug(enabled)
     if M._debug and M._db then
         -- Dump items schema for quick verification
         printf('[EmuBot][DB] DB Path: %s', tostring(M._db_path))
-        printf('[EmuBot][DB] items schema:')
-        for row in M._db:nrows("PRAGMA table_info('items');") do
+        printf('[EmuBot][DB] item_stats schema:')
+        for row in M._db:nrows("PRAGMA table_info('item_stats');") do
+            printf('  - %s (%s)', tostring(row.name), tostring(row.type))
+        end
+        printf('[EmuBot][DB] bot_items schema:')
+        for row in M._db:nrows("PRAGMA table_info('bot_items');") do
             printf('  - %s (%s)', tostring(row.name), tostring(row.type))
         end
         printf('[EmuBot][DB] bots schema:')
@@ -77,8 +81,12 @@ end
 local function dump_schema_if_debug()
     if not M._debug or not M._db then return end
     printf('[EmuBot][DB] DB Path: %s', tostring(M._db_path))
-    printf('[EmuBot][DB] items schema:')
-    for row in M._db:nrows("PRAGMA table_info('items');") do
+    printf('[EmuBot][DB] item_stats schema:')
+    for row in M._db:nrows("PRAGMA table_info('item_stats');") do
+        printf('  - %s (%s)', tostring(row.name), tostring(row.type))
+    end
+    printf('[EmuBot][DB] bot_items schema:')
+    for row in M._db:nrows("PRAGMA table_info('bot_items');") do
         printf('  - %s (%s)', tostring(row.name), tostring(row.type))
     end
     printf('[EmuBot][DB] bots schema:')
@@ -183,14 +191,8 @@ local function exec_ddl()
         last_updated INTEGER
     );
 
-    CREATE TABLE IF NOT EXISTS items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        owner TEXT,
-        bot_name TEXT NOT NULL,
-        location TEXT NOT NULL,
-        slotid INTEGER,
-        slotname TEXT,
-        name TEXT,
+    CREATE TABLE IF NOT EXISTS item_stats (
+        name TEXT PRIMARY KEY,
         itemID INTEGER,
         icon INTEGER,
         ac INTEGER,
@@ -199,22 +201,34 @@ local function exec_ddl()
         itemlink TEXT,
         rawline TEXT,
         qty INTEGER,
-        nodrop INTEGER,
         stackSize INTEGER,
         charges INTEGER,
+        nodrop INTEGER,
         aug1Name TEXT, aug1link TEXT, aug1Icon INTEGER,
         aug2Name TEXT, aug2link TEXT, aug2Icon INTEGER,
         aug3Name TEXT, aug3link TEXT, aug3Icon INTEGER,
         aug4Name TEXT, aug4link TEXT, aug4Icon INTEGER,
         aug5Name TEXT, aug5link TEXT, aug5Icon INTEGER,
         aug6Name TEXT, aug6link TEXT, aug6Icon INTEGER,
-        damage INTEGER, delay INTEGER
+        damage INTEGER,
+        delay INTEGER
     );
 
-    CREATE INDEX IF NOT EXISTS idx_items_bot ON items(bot_name);
-    CREATE INDEX IF NOT EXISTS idx_items_bot_loc ON items(bot_name, location);
-    CREATE INDEX IF NOT EXISTS idx_items_slot ON items(slotid);
-    CREATE INDEX IF NOT EXISTS idx_items_owner_bot ON items(owner, bot_name);
+    CREATE TABLE IF NOT EXISTS bot_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner TEXT,
+        bot_name TEXT NOT NULL,
+        location TEXT NOT NULL,
+        slotid INTEGER,
+        slotname TEXT,
+        item_name TEXT NOT NULL,
+        FOREIGN KEY(item_name) REFERENCES item_stats(name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_bot_items_bot ON bot_items(owner, bot_name, location);
+    CREATE INDEX IF NOT EXISTS idx_bot_items_slot ON bot_items(slotid);
+    CREATE INDEX IF NOT EXISTS idx_bot_items_item ON bot_items(item_name);
+    CREATE INDEX IF NOT EXISTS idx_item_stats_itemid ON item_stats(itemID);
 
     CREATE TABLE IF NOT EXISTS bot_groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,28 +264,187 @@ local function column_exists(table_name, column_name)
     return exists
 end
 
-local function run_migrations()
-    -- Add damage/delay columns to items if they are missing
-    if not column_exists('items', 'damage') then
-        M._db:exec('ALTER TABLE items ADD COLUMN damage INTEGER;')
-        -- Backfill to 0 for existing rows
-        M._db:exec('UPDATE items SET damage = 0 WHERE damage IS NULL;')
-    end
-    if not column_exists('items', 'delay') then
-        M._db:exec('ALTER TABLE items ADD COLUMN delay INTEGER;')
-        -- Backfill to 0 for existing rows
-        M._db:exec('UPDATE items SET delay = 0 WHERE delay IS NULL;')
-    end
+local function table_exists(table_name)
+    local stmt = M._db:prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+    if not stmt then return false end
+    stmt:bind_values(table_name)
+    local rc = stmt:step()
+    local exists = (rc == sqlite3.ROW)
+    stmt:finalize()
+    return exists
+end
 
-    -- Owner scoping support (bots/items)
+local function sanitize_item_name(name)
+    if not name then return nil end
+    local str = tostring(name)
+    str = str:gsub('^%s+', ''):gsub('%s+$', '')
+    if str == '' then return nil end
+    return str
+end
+
+local upsert_item_stats_record
+local insert_bot_item_record
+
+local function run_migrations()
+    -- Owner scoping support (bots)
     if not column_exists('bots', 'owner') then
         M._db:exec('ALTER TABLE bots ADD COLUMN owner TEXT;')
     end
-    if not column_exists('items', 'owner') then
-        M._db:exec('ALTER TABLE items ADD COLUMN owner TEXT;')
+
+    -- Legacy migration: move denormalized items into normalized tables
+    local legacy_items_table = table_exists('items') and column_exists('items', 'bot_name')
+    local already_normalized = table_exists('bot_items') and table_exists('item_stats')
+    if legacy_items_table and already_normalized then
+        -- Determine if migration already occurred (no bot_items rows yet)
+        local has_bot_items = false
+        for _ in M._db:nrows('SELECT 1 FROM bot_items LIMIT 1') do
+            has_bot_items = true
+            break
+        end
+
+        if not has_bot_items then
+            for row in M._db:nrows('SELECT * FROM items') do
+                local sanitized = sanitize_item_name(row.name)
+                if sanitized and sanitized ~= '' then
+                    local item_record = {
+                        name = sanitized,
+                        itemID = tonumber(row.itemID),
+                        icon = tonumber(row.icon),
+                        ac = tonumber(row.ac),
+                        hp = tonumber(row.hp),
+                        mana = tonumber(row.mana),
+                        itemlink = row.itemlink,
+                        rawline = row.rawline,
+                        qty = tonumber(row.qty),
+                        stackSize = tonumber(row.stackSize),
+                        charges = tonumber(row.charges),
+                        nodrop = tonumber(row.nodrop),
+                        damage = tonumber(row.damage),
+                        delay = tonumber(row.delay),
+                        aug1Name = row.aug1Name, aug1link = row.aug1link, aug1Icon = tonumber(row.aug1Icon),
+                        aug2Name = row.aug2Name, aug2link = row.aug2link, aug2Icon = tonumber(row.aug2Icon),
+                        aug3Name = row.aug3Name, aug3link = row.aug3link, aug3Icon = tonumber(row.aug3Icon),
+                        aug4Name = row.aug4Name, aug4link = row.aug4link, aug4Icon = tonumber(row.aug4Icon),
+                        aug5Name = row.aug5Name, aug5link = row.aug5link, aug5Icon = tonumber(row.aug5Icon),
+                        aug6Name = row.aug6Name, aug6link = row.aug6link, aug6Icon = tonumber(row.aug6Icon),
+                    }
+                    upsert_item_stats_record(item_record)
+
+                    insert_bot_item_record({
+                        owner = row.owner,
+                        bot_name = row.bot_name,
+                        location = row.location,
+                        slotid = tonumber(row.slotid),
+                        slotname = row.slotname,
+                        item_name = sanitized,
+                    })
+                end
+            end
+
+            -- Preserve legacy data but mark table as unused
+            local renamed, err = pcall(function()
+                M._db:exec('ALTER TABLE items RENAME TO items_legacy;')
+            end)
+            if not renamed and M._debug then
+                printf('[EmuBot][DB][migrate] Failed to rename legacy items table: %s', tostring(err))
+            end
+        end
     end
-    -- Ensure index for owner lookups exists
-    M._db:exec('CREATE INDEX IF NOT EXISTS idx_items_owner_bot ON items(owner, bot_name);')
+
+    -- Ensure indexes exist for normalized schema
+    M._db:exec('CREATE INDEX IF NOT EXISTS idx_bot_items_bot ON bot_items(owner, bot_name, location);')
+    M._db:exec('CREATE INDEX IF NOT EXISTS idx_bot_items_slot ON bot_items(slotid);')
+    M._db:exec('CREATE INDEX IF NOT EXISTS idx_bot_items_item ON bot_items(item_name);')
+    M._db:exec('CREATE INDEX IF NOT EXISTS idx_item_stats_itemid ON item_stats(itemID);')
+end
+
+upsert_item_stats_record = function(item)
+    if not item or not item.name or item.name == '' then return false, 'item name required' end
+    local stmt = M._db:prepare([[INSERT INTO item_stats(
+        name, itemID, icon, ac, hp, mana, itemlink, rawline, qty, stackSize, charges, nodrop,
+        aug1Name, aug1link, aug1Icon,
+        aug2Name, aug2link, aug2Icon,
+        aug3Name, aug3link, aug3Icon,
+        aug4Name, aug4link, aug4Icon,
+        aug5Name, aug5link, aug5Icon,
+        aug6Name, aug6link, aug6Icon,
+        damage, delay
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(name) DO UPDATE SET
+        itemID = COALESCE(excluded.itemID, item_stats.itemID),
+        icon = COALESCE(excluded.icon, item_stats.icon),
+        ac = COALESCE(excluded.ac, item_stats.ac),
+        hp = COALESCE(excluded.hp, item_stats.hp),
+        mana = COALESCE(excluded.mana, item_stats.mana),
+        itemlink = COALESCE(excluded.itemlink, item_stats.itemlink),
+        rawline = COALESCE(excluded.rawline, item_stats.rawline),
+        qty = COALESCE(excluded.qty, item_stats.qty),
+        stackSize = COALESCE(excluded.stackSize, item_stats.stackSize),
+        charges = COALESCE(excluded.charges, item_stats.charges),
+        nodrop = COALESCE(excluded.nodrop, item_stats.nodrop),
+        aug1Name = COALESCE(excluded.aug1Name, item_stats.aug1Name),
+        aug1link = COALESCE(excluded.aug1link, item_stats.aug1link),
+        aug1Icon = COALESCE(excluded.aug1Icon, item_stats.aug1Icon),
+        aug2Name = COALESCE(excluded.aug2Name, item_stats.aug2Name),
+        aug2link = COALESCE(excluded.aug2link, item_stats.aug2link),
+        aug2Icon = COALESCE(excluded.aug2Icon, item_stats.aug2Icon),
+        aug3Name = COALESCE(excluded.aug3Name, item_stats.aug3Name),
+        aug3link = COALESCE(excluded.aug3link, item_stats.aug3link),
+        aug3Icon = COALESCE(excluded.aug3Icon, item_stats.aug3Icon),
+        aug4Name = COALESCE(excluded.aug4Name, item_stats.aug4Name),
+        aug4link = COALESCE(excluded.aug4link, item_stats.aug4link),
+        aug4Icon = COALESCE(excluded.aug4Icon, item_stats.aug4Icon),
+        aug5Name = COALESCE(excluded.aug5Name, item_stats.aug5Name),
+        aug5link = COALESCE(excluded.aug5link, item_stats.aug5link),
+        aug5Icon = COALESCE(excluded.aug5Icon, item_stats.aug5Icon),
+        aug6Name = COALESCE(excluded.aug6Name, item_stats.aug6Name),
+        aug6link = COALESCE(excluded.aug6link, item_stats.aug6link),
+        aug6Icon = COALESCE(excluded.aug6Icon, item_stats.aug6Icon),
+        damage = COALESCE(excluded.damage, item_stats.damage),
+        delay = COALESCE(excluded.delay, item_stats.delay)
+    )]])
+    if not stmt then return false, last_error() end
+    stmt:bind_values(
+        item.name,
+        tonumber(item.itemID), tonumber(item.icon), tonumber(item.ac), tonumber(item.hp), tonumber(item.mana),
+        item.itemlink, item.rawline, tonumber(item.qty), tonumber(item.stackSize), tonumber(item.charges), tonumber(item.nodrop),
+        item.aug1Name, item.aug1link, tonumber(item.aug1Icon),
+        item.aug2Name, item.aug2link, tonumber(item.aug2Icon),
+        item.aug3Name, item.aug3link, tonumber(item.aug3Icon),
+        item.aug4Name, item.aug4link, tonumber(item.aug4Icon),
+        item.aug5Name, item.aug5link, tonumber(item.aug5Icon),
+        item.aug6Name, item.aug6link, tonumber(item.aug6Icon),
+        tonumber(item.damage), tonumber(item.delay)
+    )
+    local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    local err = not ok and last_error() or nil
+    stmt:finalize()
+    if not ok then return false, err end
+    return true
+end
+
+insert_bot_item_record = function(entry)
+    if not entry or not entry.bot_name or not entry.location or not entry.item_name or entry.item_name == '' then
+        return false, 'invalid bot item entry'
+    end
+    local stmt = M._db:prepare([[INSERT INTO bot_items(owner, bot_name, location, slotid, slotname, item_name)
+        VALUES(?,?,?,?,?,?)]])
+    if not stmt then return false, last_error() end
+    stmt:bind_values(
+        entry.owner,
+        entry.bot_name,
+        entry.location,
+        tonumber(entry.slotid),
+        entry.slotname,
+        entry.item_name
+    )
+    local rc = stmt:step()
+    local ok = (rc == sqlite3.DONE)
+    local err = not ok and last_error() or nil
+    stmt:finalize()
+    if not ok then return false, err end
+    return true
 end
 
 function M.init()
@@ -397,69 +570,60 @@ local function last_error()
 end
 
 local function insert_item(botName, location, it)
+    if not it then return true end
+    local sanitizedName = sanitize_item_name(it.name)
+    if not sanitizedName then return true end
     if M._debug then
         printf('[EmuBot][DB][insert] bot=%s loc=%s slot=%s name="%s" itemID=%s ac=%s hp=%s mana=%s dmg=%s dly=%s linkLen=%s rawLen=%s',
             tostring(botName), tostring(location), tostring(it.slotid), tostring(it.name or ''), tostring(it.itemID or 'nil'),
             tostring(it.ac or 'nil'), tostring(it.hp or 'nil'), tostring(it.mana or 'nil'), tostring(it.damage or 'nil'), tostring(it.delay or 'nil'),
             tostring(it.itemlink and #tostring(it.itemlink) or 0), tostring(it.rawline and #tostring(it.rawline) or 0))
     end
+
+    local stats_item = {
+        name = sanitizedName,
+        itemID = it.itemID,
+        icon = it.icon,
+        ac = it.ac,
+        hp = it.hp,
+        mana = it.mana,
+        itemlink = it.itemlink,
+        rawline = it.rawline,
+        qty = it.qty,
+        stackSize = it.stackSize,
+        charges = it.charges,
+        nodrop = it.nodrop,
+        damage = it.damage,
+        delay = it.delay,
+        aug1Name = it.aug1Name, aug1link = it.aug1link, aug1Icon = it.aug1Icon,
+        aug2Name = it.aug2Name, aug2link = it.aug2link, aug2Icon = it.aug2Icon,
+        aug3Name = it.aug3Name, aug3link = it.aug3link, aug3Icon = it.aug3Icon,
+        aug4Name = it.aug4Name, aug4link = it.aug4link, aug4Icon = it.aug4Icon,
+        aug5Name = it.aug5Name, aug5link = it.aug5link, aug5Icon = it.aug5Icon,
+        aug6Name = it.aug6Name, aug6link = it.aug6link, aug6Icon = it.aug6Icon,
+    }
+
+    local ok_stats, err_stats = upsert_item_stats_record(stats_item)
+    if not ok_stats then
+        if M._debug then printf('[EmuBot][DB][insert] upsert stats failed: %s', tostring(err_stats)) end
+        return false, err_stats
+    end
+
     local owner = get_owner_name()
-    local stmt = M._db:prepare([[INSERT INTO items(
-        owner,
-        bot_name, location, slotid, slotname, name, itemID, icon, ac, hp, mana,
-        itemlink, rawline, qty, nodrop, stackSize, charges,
-        aug1Name, aug1link, aug1Icon,
-        aug2Name, aug2link, aug2Icon,
-        aug3Name, aug3link, aug3Icon,
-        aug4Name, aug4link, aug4Icon,
-        aug5Name, aug5link, aug5Icon,
-        aug6Name, aug6link, aug6Icon,
-        damage, delay
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]])
-    if not stmt then
-        -- Retry once after ensuring migrations
-        run_migrations()
-        stmt = M._db:prepare([[INSERT INTO items(
-        owner,
-        bot_name, location, slotid, slotname, name, itemID, icon, ac, hp, mana,
-        itemlink, rawline, qty, nodrop, stackSize, charges,
-        aug1Name, aug1link, aug1Icon,
-        aug2Name, aug2link, aug2Icon,
-        aug3Name, aug3link, aug3Icon,
-        aug4Name, aug4link, aug4Icon,
-        aug5Name, aug5link, aug5Icon,
-        aug6Name, aug6link, aug6Icon,
-        damage, delay
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]])
+    local ok_link, err_link = insert_bot_item_record({
+        owner = owner,
+        bot_name = botName,
+        location = location,
+        slotid = tonumber(it.slotid),
+        slotname = it.slotname,
+        item_name = sanitizedName,
+    })
+
+    if not ok_link then
+        if M._debug then printf('[EmuBot][DB][insert] link insert failed: %s', tostring(err_link)) end
+        return false, err_link
     end
-    if not stmt then
-        local err = last_error()
-        if M._debug then printf('[EmuBot][DB][insert] prepare failed: %s', tostring(err)) end
-        return false, 'prepare failed'
-    end
-    stmt:bind_values(
-        owner,
-        botName, location,
-        tonumber(it.slotid), it.slotname, it.name, tonumber(it.itemID), tonumber(it.icon),
-        tonumber(it.ac), tonumber(it.hp), tonumber(it.mana),
-        it.itemlink, it.rawline, tonumber(it.qty), tonumber(it.nodrop), tonumber(it.stackSize), tonumber(it.charges),
-        it.aug1Name, it.aug1link, tonumber(it.aug1Icon),
-        it.aug2Name, it.aug2link, tonumber(it.aug2Icon),
-        it.aug3Name, it.aug3link, tonumber(it.aug3Icon),
-        it.aug4Name, it.aug4link, tonumber(it.aug4Icon),
-        it.aug5Name, it.aug5link, tonumber(it.aug5Icon),
-        it.aug6Name, it.aug6link, tonumber(it.aug6Icon),
-        tonumber(it.damage) or 0, tonumber(it.delay) or 0
-    )
-    local rc = stmt:step()
-    local ok = (rc == sqlite3.DONE)
-    if not ok then
-        local err = last_error()
-        if M._debug then printf('[EmuBot][DB][insert] step failed: %s', tostring(err)) end
-        stmt:finalize()
-        return false, err
-    end
-    stmt:finalize()
+
     if M._debug then printf('[EmuBot][DB][insert] OK for %s:%s slot %s', tostring(botName), tostring(location), tostring(it.slotid)) end
     return true
 end
@@ -477,7 +641,7 @@ function M.save_bot_inventory(botName, data, meta)
 
     -- Replace Equipped items for this bot (scoped by owner)
     local owner = get_owner_name()
-    local del = M._db:prepare('DELETE FROM items WHERE owner=? AND bot_name=? AND location=?')
+    local del = M._db:prepare('DELETE FROM bot_items WHERE owner=? AND bot_name=? AND location=?')
     del:bind_values(owner, botName, 'Equipped')
     del:step()
     del:finalize()
@@ -528,14 +692,50 @@ function M.load_all()
     local result = {}
     for _, b in ipairs(bots) do
         result[b.name] = { name = b.name, equipped = {}, bags = {}, bank = {} }
-        local items = collect_rows('SELECT * FROM items WHERE owner=? AND bot_name=? AND location=? ORDER BY slotid', function(s)
+        local items = collect_rows([[SELECT
+            bi.slotid,
+            bi.slotname,
+            bi.item_name,
+            stats.name AS stats_name,
+            stats.itemID,
+            stats.icon,
+            stats.ac,
+            stats.hp,
+            stats.mana,
+            stats.itemlink,
+            stats.rawline,
+            stats.qty,
+            stats.stackSize,
+            stats.charges,
+            stats.nodrop,
+            stats.aug1Name, stats.aug1link, stats.aug1Icon,
+            stats.aug2Name, stats.aug2link, stats.aug2Icon,
+            stats.aug3Name, stats.aug3link, stats.aug3Icon,
+            stats.aug4Name, stats.aug4link, stats.aug4Icon,
+            stats.aug5Name, stats.aug5link, stats.aug5Icon,
+            stats.aug6Name, stats.aug6link, stats.aug6Icon,
+            stats.damage,
+            stats.delay
+        FROM bot_items AS bi
+        LEFT JOIN item_stats AS stats ON stats.name = bi.item_name
+        WHERE bi.owner=? AND bi.bot_name=? AND bi.location=?
+        ORDER BY bi.slotid]], function(s)
             s:bind_values(owner, b.name, 'Equipped')
         end)
         for _, r in ipairs(items) do
             table.insert(result[b.name].equipped, {
-                name = r.name, slotid = tonumber(r.slotid), slotname = r.slotname,
-                itemlink = r.itemlink, rawline = r.rawline, itemID = tonumber(r.itemID), icon = tonumber(r.icon),
-                ac = tonumber(r.ac) or 0, hp = tonumber(r.hp) or 0, mana = tonumber(r.mana) or 0, qty = tonumber(r.qty) or 0, nodrop = tonumber(r.nodrop) or 0,
+                name = r.item_name or r.stats_name,
+                slotid = tonumber(r.slotid),
+                slotname = r.slotname,
+                itemlink = r.itemlink,
+                rawline = r.rawline,
+                itemID = tonumber(r.itemID),
+                icon = tonumber(r.icon),
+                ac = tonumber(r.ac) or 0,
+                hp = tonumber(r.hp) or 0,
+                mana = tonumber(r.mana) or 0,
+                qty = tonumber(r.qty) or 0,
+                nodrop = tonumber(r.nodrop) or 0,
                 stackSize = tonumber(r.stackSize), charges = tonumber(r.charges),
                 aug1Name = r.aug1Name, aug1link = r.aug1link, aug1Icon = tonumber(r.aug1Icon),
                 aug2Name = r.aug2Name, aug2link = r.aug2link, aug2Icon = tonumber(r.aug2Icon),
