@@ -27,7 +27,7 @@ BotInventory.bot_list_capture_set = {}
 BotInventory.invlist_issued_time = nil
 BotInventory._resources_dir = nil
 BotInventory._capture_count = {}
-BotInventory.item_cache_by_id = {}
+BotInventory.item_cache_by_name = {}
 BotInventory._debug = false
 
 local function debugPrintf(fmt, ...)
@@ -61,10 +61,12 @@ for _, field in ipairs(CACHEABLE_ICON_FIELDS) do CACHEABLE_FIELDS[#CACHEABLE_FIE
 for _, field in ipairs(CACHEABLE_MISC_FIELDS) do CACHEABLE_FIELDS[#CACHEABLE_FIELDS + 1] = field end
 for _, field in ipairs(CACHEABLE_AUGMENT_FIELDS) do CACHEABLE_FIELDS[#CACHEABLE_FIELDS + 1] = field end
 
-local function normalizeItemID(itemID)
-    local numeric = tonumber(itemID)
-    if not numeric or numeric <= 0 then return nil end
-    return numeric
+local function normalizeItemName(name)
+    if not name then return nil end
+    local str = tostring(name)
+    str = str:gsub('^%s+', ''):gsub('%s+$', '')
+    if str == '' then return nil end
+    return string.lower(str)
 end
 
 local function isStringEmpty(value)
@@ -106,9 +108,9 @@ local function itemHasCacheableData(item)
 end
 
 function BotInventory.apply_cached_item_stats(item)
-    local itemID = normalizeItemID(item and item.itemID)
-    if not itemID then return false end
-    local cached = BotInventory.item_cache_by_id[itemID]
+    local cacheKey = normalizeItemName(item and item.name)
+    if not cacheKey then return false end
+    local cached = BotInventory.item_cache_by_name[cacheKey]
     if not cached then return false end
 
     local applied = false
@@ -128,10 +130,10 @@ function BotInventory.apply_cached_item_stats(item)
 end
 
 function BotInventory.update_item_cache(item)
-    local itemID = normalizeItemID(item and item.itemID)
-    if not itemID or not itemHasCacheableData(item) then return false end
+    local cacheKey = normalizeItemName(item and item.name)
+    if not cacheKey or not itemHasCacheableData(item) then return false end
 
-    local entry = BotInventory.item_cache_by_id[itemID] or {}
+    local entry = BotInventory.item_cache_by_name[cacheKey] or {}
     for _, field in ipairs(CACHEABLE_FIELDS) do
         local value = item[field]
         if value ~= nil then
@@ -142,7 +144,7 @@ function BotInventory.update_item_cache(item)
             end
         end
     end
-    BotInventory.item_cache_by_id[itemID] = entry
+    BotInventory.item_cache_by_name[cacheKey] = entry
     item._cacheMiss = false
     return true
 end
@@ -198,25 +200,25 @@ function BotInventory.ensure_item_cached(item)
     return needsScan
 end
 
-function BotInventory.invalidate_item_cache(itemID)
-    local numeric = normalizeItemID(itemID)
-    if not numeric then return false end
-    if BotInventory.item_cache_by_id[numeric] then
-        BotInventory.item_cache_by_id[numeric] = nil
+function BotInventory.invalidate_item_cache(itemName)
+    local cacheKey = normalizeItemName(itemName)
+    if not cacheKey then return false end
+    if BotInventory.item_cache_by_name[cacheKey] then
+        BotInventory.item_cache_by_name[cacheKey] = nil
         return true
     end
     return false
 end
 
-function BotInventory.invalidate_item_cache_if_unused(itemID)
-    local numeric = normalizeItemID(itemID)
-    if not numeric then return false end
+function BotInventory.invalidate_item_cache_if_unused(itemName)
+    local cacheKey = normalizeItemName(itemName)
+    if not cacheKey then return false end
 
     local function collectionHasItem(collection)
         if type(collection) ~= 'table' then return false end
         for _, entry in pairs(collection) do
             if type(entry) == 'table' then
-                if normalizeItemID(entry.itemID) == numeric then
+                if normalizeItemName(entry.name) == cacheKey then
                     return true
                 end
                 if collectionHasItem(entry) then
@@ -233,7 +235,7 @@ function BotInventory.invalidate_item_cache_if_unused(itemID)
         end
     end
 
-    BotInventory.item_cache_by_id[numeric] = nil
+    BotInventory.item_cache_by_name[cacheKey] = nil
     return true
 end
 
@@ -978,11 +980,11 @@ local function displayBotUnequipResponse(line, slotNum, itemName)
         for i = #BotInventory.bot_inventories[botName].equipped, 1, -1 do
             local item = BotInventory.bot_inventories[botName].equipped[i]
             if tonumber(item.slotid) == tonumber(slotNum) then
-                local removedItemID = item.itemID
+                local removedItemName = item.name
                 table.remove(BotInventory.bot_inventories[botName].equipped, i)
                 print(string.format("[BotInventory] Removed %s from cached inventory", item.name or "item"))
-                if removedItemID then
-                    BotInventory.invalidate_item_cache_if_unused(removedItemID)
+                if removedItemName then
+                    BotInventory.invalidate_item_cache_if_unused(removedItemName)
                 end
                 removed = true
                 break
