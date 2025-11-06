@@ -759,29 +759,57 @@ function botUI._completeScanAllBotStep(botName, shouldCamp)
     if botData and botData.equipped then
         local itemsToScan = {}
         for _, item in ipairs(botData.equipped) do
-            -- Check if item needs scanning (missing stats or has zero stats)
-            local needsScanning = (not item.ac and not item.hp and not item.mana)
-                or ((tonumber(item.ac or 0) == 0) and (tonumber(item.hp or 0) == 0) and (tonumber(item.mana or 0) == 0))
-
-            -- If this is a likely weapon slot, also scan when damage/delay are missing
+            local scanReasons = {}
             local sid = tonumber(item.slotid or -1) or -1
-            if sid == 11 or sid == 13 or sid == 14 then
-                local dmgZero = (tonumber(item.damage or 0) == 0)
-                local dlyZero = (tonumber(item.delay or 0) == 0)
-                if dmgZero or dlyZero then
-                    needsScanning = true
+            local slotNameLower = tostring(item.slotname or item.slot or ''):lower()
+            local isAmmoSlot = (slotNameLower == 'ammo') or (sid == 21)
+
+            if not isAmmoSlot then
+                -- Primary stats missing or zero?
+                local hasPrimaryStats = (item.ac ~= nil) or (item.hp ~= nil) or (item.mana ~= nil)
+                local acVal = tonumber(item.ac or 0) or 0
+                local hpVal = tonumber(item.hp or 0) or 0
+                local manaVal = tonumber(item.mana or 0) or 0
+
+                if not hasPrimaryStats then
+                    table.insert(scanReasons, 'missing AC/HP/Mana')
+                elseif acVal == 0 and hpVal == 0 and manaVal == 0 then
+                    table.insert(scanReasons, 'AC/HP/Mana all zero')
                 end
             end
+
+            -- Weapon stats check removed (primary weapons without damage/delay are no longer forced to rescan)
             
-            if needsScanning and item.itemlink and item.itemlink ~= '' then
-                table.insert(itemsToScan, item)
+            if #scanReasons > 0 then
+                local itemName = item.name or 'Unknown Item'
+                local slotLabel = item.slotname or item.slot or item.slotid or '?'
+                local reasonText = table.concat(scanReasons, '; ')
+                if item.itemlink and item.itemlink ~= '' then
+                    printf('[EmuBot]   -> %s [%s] queued for rescan (%s). Stats: AC=%s HP=%s Mana=%s DMG=%s DLY=%s',
+                        itemName,
+                        tostring(slotLabel),
+                        reasonText,
+                        tostring(item.ac or 'nil'),
+                        tostring(item.hp or 'nil'),
+                        tostring(item.mana or 'nil'),
+                        tostring(item.damage or 'nil'),
+                        tostring(item.delay or 'nil')
+                    )
+                    table.insert(itemsToScan, item)
+                else
+                    printf('[EmuBot]   -> %s [%s] needs rescan (%s) but has no item link available',
+                        itemName,
+                        tostring(slotLabel),
+                        reasonText
+                    )
+                end
             end
         end
         
         if #itemsToScan > 0 then
             botUI._scanAllTotalItems = botUI._scanAllTotalItems + #itemsToScan
             printf('[EmuBot] Queueing %d items from %s for detailed scanning...', #itemsToScan, botName)
-for _, item in ipairs(itemsToScan) do
+            for _, item in ipairs(itemsToScan) do
                 botUI.enqueueItemScan(item, botName)
             end
         else

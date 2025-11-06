@@ -13,7 +13,10 @@ local function get_sort_spec(sortSpecs, index)
     local specsField = sortSpecs.Specs
 
     if type(specsField) == 'function' then
-        local spec = try_call(specsField, sortSpecs, index - 1)
+        local spec = try_call(specsField, sortSpecs, index)
+        if not spec then
+            spec = try_call(specsField, sortSpecs, index - 1)
+        end
         if spec then return spec end
     elseif type(specsField) == 'table' then
         if specsField[index] ~= nil then return specsField[index] end
@@ -26,11 +29,17 @@ local function get_sort_spec(sortSpecs, index)
     end
 
     if type(sortSpecs.SpecsGet) == 'function' then
-        local spec = try_call(sortSpecs.SpecsGet, sortSpecs, index - 1)
+        local spec = try_call(sortSpecs.SpecsGet, sortSpecs, index)
+        if not spec then
+            spec = try_call(sortSpecs.SpecsGet, sortSpecs, index - 1)
+        end
         if spec then return spec end
     end
     if type(sortSpecs.SpecsIndex) == 'function' then
-        local spec = try_call(sortSpecs.SpecsIndex, sortSpecs, index - 1)
+        local spec = try_call(sortSpecs.SpecsIndex, sortSpecs, index)
+        if not spec then
+            spec = try_call(sortSpecs.SpecsIndex, sortSpecs, index - 1)
+        end
         if spec then return spec end
     end
     if type(sortSpecs.Specs) == 'table' then
@@ -43,10 +52,17 @@ local function get_sort_spec(sortSpecs, index)
 end
 
 local function applyTableSort(data, sortSpecs, accessors)
-    if not sortSpecs or sortSpecs.SpecsCount == 0 or not data then return end
+    if not sortSpecs or not data then return end
+
+    local specsCount = sortSpecs.SpecsCount
+    if type(specsCount) == 'function' then
+        specsCount = try_call(specsCount, sortSpecs) or 0
+    end
+    specsCount = tonumber(specsCount) or 0
+    if specsCount == 0 then return end
 
     table.sort(data, function(a, b)
-        for i = 1, sortSpecs.SpecsCount do
+        for i = 1, specsCount do
             local spec = get_sort_spec(sortSpecs, i)
             if spec then
                 local colIdx = (spec.ColumnIndex or 0) + 1
