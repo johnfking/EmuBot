@@ -10,6 +10,7 @@ local db = require('EmuBot.modules.db')
 local commandsui = require('EmuBot.ui.commandsui')
 local bot_controls = require('EmuBot.ui.bot_controls')
 local raid_hud = require('EmuBot.ui.raid_hud')
+local applyTableSort = require('EmuBot.modules.ui_table_utils').applyTableSort
 
 -- EmuBot UI style helpers: round all relevant UI elements at radius 8
 local function EmuBot_PushRounding()
@@ -103,6 +104,11 @@ local botUI = {
     showClassInVisual = false,
     -- Selector options
     viewerAppendClassAbbrevInSelector = false,
+    -- Cache of item stats keyed by itemID to avoid duplicate scans per session
+    _itemStatCache = {},
+    -- Database maintenance status
+    lastPurgeMessage = nil,
+    lastPurgeWasSuccess = false,
 }
 
 -- Forward declare helpers referenced before their definitions
@@ -134,6 +140,7 @@ local function processDeferredTasks()
         printf('[EmuBot] Deferred task error: %s', tostring(err))
     end
 end
+
 
 local function captureDisplayItemIcon(target)
     if not target then return end
@@ -289,36 +296,38 @@ end
 local function collectBotNames()
     local set = {}
     local list = {}
+    local function tryAdd(name)
+        if not name or type(name) ~= 'string' then return end
+        local trimmed = name:match('^%s*(.-)%s*$')
+        if not trimmed or trimmed == '' then return end
+        if bot_inventory and bot_inventory.isBotOwnedByCurrentCharacter and not bot_inventory.isBotOwnedByCurrentCharacter(trimmed) then
+            return
+        end
+        if set[trimmed] then return end
+        set[trimmed] = true
+        table.insert(list, trimmed)
+    end
 
     if bot_inventory then
         -- Get bots from getAllBots function
         if bot_inventory.getAllBots then
             local allBots = bot_inventory.getAllBots() or {}
             for _, name in ipairs(allBots) do
-                if name and type(name) == 'string' and name:match('^%s*(.-)%s*$') ~= '' and not set[name] then
-                    set[name] = true
-                    table.insert(list, name)
-                end
+                tryAdd(name)
             end
         end
         
         -- Get bots from bot_inventories
         if bot_inventory.bot_inventories then
             for name in pairs(bot_inventory.bot_inventories) do
-                if name and type(name) == 'string' and name:match('^%s*(.-)%s*$') ~= '' and not set[name] then
-                    set[name] = true
-                    table.insert(list, name)
-                end
+                tryAdd(name)
             end
         end
         
         -- Get bots from cached_bot_list
         if bot_inventory.cached_bot_list then
             for _, name in ipairs(bot_inventory.cached_bot_list) do
-                if name and type(name) == 'string' and name:match('^%s*(.-)%s*$') ~= '' and not set[name] then
-                    set[name] = true
-                    table.insert(list, name)
-                end
+                tryAdd(name)
             end
         end
     end
@@ -348,55 +357,104 @@ local function collectBotSlotItems(slotId)
 
     if botUI.selectedBot and botUI.selectedBot.name then
         local name = botUI.selectedBot.name
-        if not nameSet[name] then
-            table.insert(names, name)
-            nameSet[name] = true
+        local trimmed = name and name:match('^%s*(.-)%s*$') or name
+        if trimmed and trimmed ~= '' and not nameSet[trimmed] then
+            table.insert(names, trimmed)
+            nameSet[trimmed] = true
         end
     end
 
     if #names == 0 and botUI.selectedBot and botUI.selectedBot.name then
-        table.insert(names, botUI.selectedBot.name)
+        local trimmed = botUI.selectedBot.name:match('^%s*(.-)%s*$') or botUI.selectedBot.name
+        if trimmed and trimmed ~= '' then
+            table.insert(names, trimmed)
+        end
     end
 
     for _, botName in ipairs(names) do
-        local foundItem = nil
-        local cachedData = bot_inventory and bot_inventory.bot_inventories and bot_inventory.bot_inventories[botName] or nil
+        local owned = true
+        if bot_inventory and bot_inventory.isBotOwnedByCurrentCharacter then
+            owned = bot_inventory.isBotOwnedByCurrentCharacter(botName)
+        end
+        if owned then
+            local foundItem = nil
+            local cachedData = bot_inventory and bot_inventory.bot_inventories and bot_inventory.bot_inventories[botName] or nil
 
-        if botUI.selectedBot and botUI.selectedBot.name == botName and botUI.selectedBot.data then
-            for _, item in ipairs(botUI.selectedBot.data.equipped or {}) do
-                if tonumber(item.slotid) == slotId then
-                    foundItem = item
-                    break
+            if botUI.selectedBot and botUI.selectedBot.name == botName and botUI.selectedBot.data then
+                for _, item in ipairs(botUI.selectedBot.data.equipped or {}) do
+                    if tonumber(item.slotid) == slotId then
+                        foundItem = item
+                        break
+                    end
                 end
             end
-        end
 
-        if not foundItem and cachedData and cachedData.equipped then
-            for _, item in ipairs(cachedData.equipped) do
-                if tonumber(item.slotid) == slotId then
-                    foundItem = item
-                    break
+            if not foundItem and cachedData and cachedData.equipped then
+                for _, item in ipairs(cachedData.equipped) do
+                    if tonumber(item.slotid) == slotId then
+                        foundItem = item
+                        break
+                    end
                 end
             end
-        end
 
-        table.insert(results, { bot = botName, item = foundItem })
+            table.insert(results, { bot = botName, item = foundItem })
 
-        if not foundItem and bot_inventory and bot_inventory.requestBotInventory then
-            botUI._botInventoryLastAttempt[botName] = botUI._botInventoryLastAttempt[botName] or 0
-            botUI._botInventoryFetchSet[botName] = botUI._botInventoryFetchSet[botName] or false
-            if not botUI._botInventoryFetchSet[botName] then
-                table.insert(botUI._botInventoryFetchQueue, botName)
-                botUI._botInventoryFetchSet[botName] = true
-                if not botUI._botInventoryFetchActive then
-                    botUI._botInventoryFetchActive = true
-                    enqueueTask(botUI._processBotInventoryQueue)
+            if not foundItem and bot_inventory and bot_inventory.requestBotInventory then
+                botUI._botInventoryLastAttempt[botName] = botUI._botInventoryLastAttempt[botName] or 0
+                botUI._botInventoryFetchSet[botName] = botUI._botInventoryFetchSet[botName] or false
+                if not botUI._botInventoryFetchSet[botName] then
+                    table.insert(botUI._botInventoryFetchQueue, botName)
+                    botUI._botInventoryFetchSet[botName] = true
+                    if not botUI._botInventoryFetchActive then
+                        botUI._botInventoryFetchActive = true
+                        enqueueTask(botUI._processBotInventoryQueue)
+                    end
                 end
             end
         end
     end
 
     return results
+end
+
+local function performDatabasePurge()
+    if not db or not db.purge_all then
+        return false, 'Database module does not support purge.'
+    end
+
+    local ok, err = db.purge_all()
+    if not ok then return false, err end
+
+    if bot_inventory then
+        bot_inventory.bot_inventories = {}
+        bot_inventory.pending_requests = {}
+        bot_inventory.current_bot_request = nil
+        bot_inventory.cached_bot_list = {}
+        bot_inventory.refreshing_bot_list = false
+        bot_inventory.bot_list_start_time = nil
+        bot_inventory.bot_request_start_time = nil
+        bot_inventory.bot_request_phase = 0
+        bot_inventory.bot_list_capture_set = {}
+        bot_inventory._capture_count = {}
+        bot_inventory._itemStatCache = {}
+        bot_inventory.initialized = false
+        if bot_inventory.init then bot_inventory.init() end
+    end
+
+    if bot_groups then
+        bot_groups.groups = {}
+        if bot_groups.refresh_groups then bot_groups.refresh_groups() end
+    end
+
+    botUI.selectedBot = nil
+    botUI.selectedBotSlotID = nil
+    botUI.selectedBotSlotName = nil
+    botUI._itemStatCache = {}
+    botUI.lastExportMessage = nil
+    botUI.deferred_tasks = {}
+
+    return true
 end
 
 function botUI._enqueueBotInventoryFetch(botName)
@@ -881,14 +939,59 @@ function botUI._processBotInventoryQueue()
     return true
 end
 
+local function persistItemStatsForBot(item, botName)
+    if not item then return botName end
+    local resolvedBot = botName
+    if not resolvedBot then
+        for name, inv in pairs(bot_inventory.bot_inventories or {}) do
+            for _, it in ipairs(inv.equipped or {}) do
+                if it == item then
+                    resolvedBot = name
+                    break
+                end
+            end
+            if resolvedBot then break end
+        end
+    end
+    if resolvedBot then
+        local data = bot_inventory.getBotInventory and bot_inventory.getBotInventory(resolvedBot)
+        if data then
+            local meta = bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[resolvedBot] or nil
+            db.save_bot_inventory(resolvedBot, data, meta)
+        end
+    end
+    return resolvedBot
+end
+
 function botUI._processNextScan()
-local entry = table.remove(botUI._scanQueue, 1)
+    local entry = table.remove(botUI._scanQueue, 1)
     if not entry then
         botUI._scanActive = false
         return true
     end
     local current = entry.item
     local currentBot = entry.bot
+    local itemID = tonumber(current and current.itemID or 0) or 0
+
+    if itemID > 0 then
+        local cached = botUI._itemStatCache[itemID]
+        if cached then
+            current.ac = tonumber(cached.ac or current.ac or 0) or 0
+            current.hp = tonumber(cached.hp or current.hp or 0) or 0
+            current.mana = tonumber(cached.mana or current.mana or 0) or 0
+            current.damage = tonumber(cached.damage or current.damage or 0) or 0
+            current.delay = tonumber(cached.delay or current.delay or 0) or 0
+            local cachedIcon = tonumber(cached.icon or 0) or 0
+            if cachedIcon > 0 then
+                current.icon = cachedIcon
+                current.iconID = cachedIcon
+            end
+            currentBot = persistItemStatsForBot(current, currentBot)
+            enqueueTask(botUI._processNextScan)
+            return true
+        end
+    end
+
     current.ac = 0
     current.hp = 0
     current.mana = 0
@@ -965,30 +1068,22 @@ local entry = table.remove(botUI._scanQueue, 1)
         attempts = attempts + 1
         local statsCaptured, hasIcon, augCaptured, hasNonZero = tryRead()
         local hasWeaponStats = (tonumber(current.damage or 0) > 0) or (tonumber(current.delay or 0) > 0)
-if statsCaptured and (hasIcon or hasNonZero or hasWeaponStats) then
+        if statsCaptured and (hasIcon or hasNonZero or hasWeaponStats) then
             local w = mq.TLO.Window('ItemDisplayWindow')
             if w() and w.Open() then w.DoClose() end
 
-            -- Persist updated stats for the owning bot, if known
-            if not currentBot then
-                -- Fallback: find owning bot by identity match
-                for name, inv in pairs(bot_inventory.bot_inventories or {}) do
-                    for _, it in ipairs(inv.equipped or {}) do
-                        if it == current then
-                            currentBot = name
-                            break
-                        end
-                    end
-                    if currentBot then break end
-                end
+            if itemID > 0 then
+                botUI._itemStatCache[itemID] = {
+                    ac = tonumber(current.ac or 0) or 0,
+                    hp = tonumber(current.hp or 0) or 0,
+                    mana = tonumber(current.mana or 0) or 0,
+                    damage = tonumber(current.damage or 0) or 0,
+                    delay = tonumber(current.delay or 0) or 0,
+                    icon = tonumber(current.icon or current.iconID or 0) or 0,
+                }
             end
-            if currentBot then
-                local data = bot_inventory.getBotInventory and bot_inventory.getBotInventory(currentBot)
-                if data then
-                    local meta = bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[currentBot] or nil
-                    db.save_bot_inventory(currentBot, data, meta)
-                end
-            end
+
+            currentBot = persistItemStatsForBot(current, currentBot)
 
             enqueueTask(botUI._processNextScan)
             return true
@@ -1011,14 +1106,21 @@ if statsCaptured and (hasIcon or hasNonZero or hasWeaponStats) then
             elseif not hasNonZero then
                 -- No stats found, but we at least reset them to zero for consistency.
             end
-            -- If we still managed to get any useful stats (weapon or otherwise), persist them
-            if currentBot and ((tonumber(current.ac or 0) > 0) or (tonumber(current.hp or 0) > 0) or (tonumber(current.mana or 0) > 0)
-                or (tonumber(current.damage or 0) > 0) or (tonumber(current.delay or 0) > 0)) then
-                local data = bot_inventory.getBotInventory and bot_inventory.getBotInventory(currentBot)
-                if data then
-                    local meta = bot_inventory.bot_list_capture_set and bot_inventory.bot_list_capture_set[currentBot] or nil
-                    db.save_bot_inventory(currentBot, data, meta)
-                end
+            local hasUsefulStats = (tonumber(current.ac or 0) > 0) or (tonumber(current.hp or 0) > 0)
+                or (tonumber(current.mana or 0) > 0) or (tonumber(current.damage or 0) > 0)
+                or (tonumber(current.delay or 0) > 0)
+            if itemID > 0 and hasUsefulStats then
+                botUI._itemStatCache[itemID] = {
+                    ac = tonumber(current.ac or 0) or 0,
+                    hp = tonumber(current.hp or 0) or 0,
+                    mana = tonumber(current.mana or 0) or 0,
+                    damage = tonumber(current.damage or 0) or 0,
+                    delay = tonumber(current.delay or 0) or 0,
+                    icon = tonumber(current.icon or current.iconID or 0) or 0,
+                }
+            end
+            if hasUsefulStats then
+                currentBot = persistItemStatsForBot(current, currentBot)
             end
             enqueueTask(botUI._processNextScan)
             return true
@@ -1624,8 +1726,8 @@ EmuBot_PushRounding()
             ImGui.Spacing()
         end
         
-        if #botUI.localCompareItems > 0 and ImGui.BeginTable("LocalItemsComparisonTable", 8, 
-                           ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.Sortable) then
+        if #botUI.localCompareItems > 0 and ImGui.BeginTable('LocalItemsComparisonTable', 8,
+                ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.Sortable) then
             ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch)
             ImGui.TableSetupColumn("Source", ImGuiTableColumnFlags.WidthFixed, 80)
             ImGui.TableSetupColumn("Icon", ImGuiTableColumnFlags.WidthFixed, 48)
@@ -1635,6 +1737,20 @@ EmuBot_PushRounding()
             ImGui.TableSetupColumn("Class", ImGuiTableColumnFlags.WidthFixed, 80)
             ImGui.TableSetupColumn("Comparison", ImGuiTableColumnFlags.WidthFixed, 100)
             ImGui.TableHeadersRow()
+
+            local sortSpecs = ImGui.TableGetSortSpecs()
+            applyTableSort(botUI.localCompareItems, sortSpecs, {
+                [1] = function(row) return row.name end,
+                [2] = function(row) return row.source or '' end,
+                [3] = function(row) return row.icon or 0 end,
+                [4] = function(row) return row.ac or 0 end,
+                [5] = function(row) return row.hp or 0 end,
+                [6] = function(row) return row.mana or 0 end,
+                [7] = function(row) return row.classCompatible and 1 or 0 end,
+                [8] = function(row)
+                    return (row.ac or 0) * 10000 + (row.hp or 0) * 100 + (row.mana or 0)
+                end,
+            })
             
             -- First, show the bot's current item
             ImGui.TableNextRow()
@@ -1771,7 +1887,7 @@ EmuBot_PushRounding()
 end
 
 local function drawAugmentTab(equippedItems)
-    local flags = ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable
+    local flags = ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.Sortable
     if ImGui.BeginTable('BotAugmentTable', 8, flags) then
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 110)
         ImGui.TableSetupColumn('Item', ImGuiTableColumnFlags.WidthStretch)
@@ -1779,6 +1895,12 @@ local function drawAugmentTab(equippedItems)
             ImGui.TableSetupColumn(string.format('Aug %d', augIndex), ImGuiTableColumnFlags.WidthStretch)
         end
         ImGui.TableHeadersRow()
+
+        local sortSpecs = ImGui.TableGetSortSpecs()
+        applyTableSort(equippedItems, sortSpecs, {
+            [1] = function(row) return tonumber(row.slotid) or 0 end,
+            [2] = function(row) return row.name or '' end,
+        })
 
         for _, item in ipairs(equippedItems or {}) do
             ImGui.TableNextRow()
@@ -1995,7 +2117,7 @@ local function drawVisualTab(equippedItems)
             else
                 local _cols = botUI.showClassInVisual and 7 or 6
                 if ImGui.BeginTable('BotSlotComparison', _cols,
-                    ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+                        ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.Sortable) then
                     ImGui.TableSetupColumn('Bot', ImGuiTableColumnFlags.WidthFixed, 120)
                     if botUI.showClassInVisual then
                         ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 100)
@@ -2006,6 +2128,29 @@ local function drawVisualTab(equippedItems)
                     ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 50)
                     ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 50)
                     ImGui.TableHeadersRow()
+
+                    local sortSpecs = ImGui.TableGetSortSpecs()
+                    applyTableSort(slotResults, sortSpecs, {
+                        [1] = function(row) return row.bot or '' end,
+                        [2] = botUI.showClassInVisual and function(row)
+                            return get_bot_class_abbrev(row.bot) or ''
+                        end or nil,
+                        [botUI.showClassInVisual and 3 or 2] = function(row)
+                            return row.item and row.item.icon or 0
+                        end,
+                        [botUI.showClassInVisual and 4 or 3] = function(row)
+                            return row.item and row.item.name or ''
+                        end,
+                        [botUI.showClassInVisual and 5 or 4] = function(row)
+                            return row.item and row.item.ac or 0
+                        end,
+                        [botUI.showClassInVisual and 6 or 5] = function(row)
+                            return row.item and row.item.hp or 0
+                        end,
+                        [botUI.showClassInVisual and 7 or 6] = function(row)
+                            return row.item and row.item.mana or 0
+                        end,
+                    })
 
                     for _, entry in ipairs(slotResults) do
                         ImGui.TableNextRow()
@@ -2097,7 +2242,7 @@ end
 
 local function drawTableTab(equippedItems)
     if ImGui.BeginTable('BotEquippedTable', 7,
-        ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+            ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.Sortable) then
         ImGui.TableSetupColumn('Slot', ImGuiTableColumnFlags.WidthFixed, 100)
         ImGui.TableSetupColumn('Icon', ImGuiTableColumnFlags.WidthFixed, 48)
         ImGui.TableSetupColumn('Item Name', ImGuiTableColumnFlags.WidthStretch)
@@ -2106,6 +2251,16 @@ local function drawTableTab(equippedItems)
         ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 70)
         ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 120)
         ImGui.TableHeadersRow()
+
+        local sortSpecs = ImGui.TableGetSortSpecs()
+        applyTableSort(equippedItems, sortSpecs, {
+            [1] = function(row) return tonumber(row.slotid) or 0 end,
+            [2] = function(row) return row.icon or 0 end,
+            [3] = function(row) return row.name or '' end,
+            [4] = function(row) return row.ac or 0 end,
+            [5] = function(row) return row.hp or 0 end,
+            [6] = function(row) return row.mana or 0 end,
+        })
 
         for _, item in ipairs(equippedItems or {}) do
             ImGui.TableNextRow()
@@ -2318,7 +2473,8 @@ function drawBotGroupsTab()
     end
     
     -- Groups table
-    if ImGui.BeginTable('GroupsTable', 6, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable) then
+    if ImGui.BeginTable('GroupsTable', 6,
+            ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Resizable + ImGuiTableFlags.Sortable) then
         ImGui.TableSetupColumn('Group', ImGuiTableColumnFlags.WidthStretch)
         ImGui.TableSetupColumn('Members', ImGuiTableColumnFlags.WidthFixed, 80)
         ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 100)
@@ -2326,7 +2482,18 @@ function drawBotGroupsTab()
         ImGui.TableSetupColumn('Edit', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableSetupColumn('Delete', ImGuiTableColumnFlags.WidthFixed, 60)
         ImGui.TableHeadersRow()
-        
+
+        local sortSpecs = ImGui.TableGetSortSpecs()
+        applyTableSort(bot_groups.groups, sortSpecs, {
+            [1] = function(row) return row.name or '' end,
+            [2] = function(row)
+                return row.members and #row.members or 0
+            end,
+            [3] = function(row)
+                return row.status or ''
+            end,
+        })
+
         for _, group in ipairs(bot_groups.groups) do
             ImGui.TableNextRow()
             ImGui.PushID('group_' .. tostring(group.id))
@@ -2418,12 +2585,21 @@ function drawBotGroupsTab()
         -- Show current members
         ImGui.Text('Current Members:')
         if bot_groups.editingGroup.members and #bot_groups.editingGroup.members > 0 then
-            if ImGui.BeginTable('CurrentMembers', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg) then
+            if ImGui.BeginTable('CurrentMembers', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Sortable) then
                 ImGui.TableSetupColumn('Bot Name', ImGuiTableColumnFlags.WidthStretch)
                 ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
                 ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 80)
                 ImGui.TableSetupColumn('Remove', ImGuiTableColumnFlags.WidthFixed, 60)
                 ImGui.TableHeadersRow()
+
+                local sortSpecs = ImGui.TableGetSortSpecs()
+                applyTableSort(bot_groups.editingGroup.members, sortSpecs, {
+                    [1] = function(row) return row.bot_name or '' end,
+                    [2] = function(row) return get_bot_class_abbrev(row.bot_name) or '' end,
+                    [3] = function(row)
+                        return is_bot_spawned(row.bot_name) and 1 or 0
+                    end,
+                })
                 
                 for _, member in ipairs(bot_groups.editingGroup.members) do
                     ImGui.TableNextRow()
@@ -2469,12 +2645,20 @@ function drawBotGroupsTab()
         ImGui.Text('Add Bots to Group:')
         
         if #availableBots > 0 then
-            if ImGui.BeginTable('AvailableBots', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg) then
+            if ImGui.BeginTable('AvailableBots', 4,
+                    ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Sortable) then
                 ImGui.TableSetupColumn('Bot Name', ImGuiTableColumnFlags.WidthStretch)
                 ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 60)
                 ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 80)
                 ImGui.TableSetupColumn('Add', ImGuiTableColumnFlags.WidthFixed, 60)
                 ImGui.TableHeadersRow()
+
+                local sortSpecs = ImGui.TableGetSortSpecs()
+                applyTableSort(availableBots, sortSpecs, {
+                    [1] = function(row) return row or '' end,
+                    [2] = function(row) return get_bot_class_abbrev(row) or '' end,
+                    [3] = function(row) return is_bot_spawned(row) and 1 or 0 end,
+                })
                 
                 for _, botName in ipairs(availableBots) do
                     if not currentMembers[botName] then
@@ -2586,6 +2770,7 @@ EmuBot_PushRounding()
                 bot_inventory.bot_list_capture_set = {}
             end
             botUI.selectedBot = nil
+            botUI._itemStatCache = {}
         end
 
         -- Toggle HotBar button
@@ -3017,12 +3202,20 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                     ImGui.Spacing()
                     ImGui.Text(string.format('Skipped Bots (%d):', #skippedBots))
                     
-                    if ImGui.BeginTable('SkippedBotsTable', 4, ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg) then
+                    if ImGui.BeginTable('SkippedBotsTable', 4,
+                            ImGuiTableFlags.Borders + ImGuiTableFlags.RowBg + ImGuiTableFlags.Sortable) then
                         ImGui.TableSetupColumn('Bot Name', ImGuiTableColumnFlags.WidthStretch)
                         ImGui.TableSetupColumn('Failures', ImGuiTableColumnFlags.WidthFixed, 60)
                         ImGui.TableSetupColumn('Time Left', ImGuiTableColumnFlags.WidthFixed, 80)
                         ImGui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 80)
                         ImGui.TableHeadersRow()
+
+                        local sortSpecs = ImGui.TableGetSortSpecs()
+                        applyTableSort(skippedBots, sortSpecs, {
+                            [1] = function(row) return row.name or '' end,
+                            [2] = function(row) return row.failures or 0 end,
+                            [3] = function(row) return row.remaining or 0 end,
+                        })
                         
                         for i, bot in ipairs(skippedBots) do
                             ImGui.TableNextRow()
@@ -3098,6 +3291,63 @@ if ImGui.BeginTabBar('BotEquippedViewTabs', ImGuiTabBarFlags.Reorderable) then
                     else
                         ImGui.TextWrapped(message)
                     end
+                end
+
+                ImGui.Spacing()
+                ImGui.Separator()
+                ImGui.TextColored(0.9, 0.3, 0.3, 1.0, 'Danger Zone')
+                ImGui.SameLine()
+                ImGui.Text(' (server-wide data)')
+
+                ImGui.PushStyleColor(ImGuiCol.Button, 0.8, 0.2, 0.2, 0.95)
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.85, 0.25, 0.25, 1.0)
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.7, 0.15, 0.15, 1.0)
+                if ImGui.Button('Purge Database##EmuBot', ImVec2(160, 0)) then
+                    ImGui.OpenPopup('EmuBotPurgeConfirm')
+                end
+                ImGui.PopStyleColor(3)
+                if ImGui.IsItemHovered() then
+                    ImGui.SetTooltip('Drops all stored EmuBot data (bots, inventories, groups) for this server.')
+                end
+
+                if botUI.lastPurgeMessage then
+                    if botUI.lastPurgeWasSuccess then
+                        ImGui.Text(botUI.lastPurgeMessage)
+                    else
+                        ImGui.TextColored(1.0, 0.4, 0.4, 1.0, botUI.lastPurgeMessage)
+                    end
+                end
+
+                if ImGui.BeginPopupModal('EmuBotPurgeConfirm', true, ImGuiWindowFlags.AlwaysAutoResize) then
+                    ImGui.TextWrapped('This will drop all EmuBot SQLite tables for this server and rebuild them empty. All cached inventories, groups, and item data will be lost. Are you sure you want to continue?')
+                    ImGui.Spacing()
+                    ImGui.Separator()
+                    ImGui.Spacing()
+
+                    ImGui.PushStyleColor(ImGuiCol.Button, 0.8, 0.2, 0.2, 0.95)
+                    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.85, 0.25, 0.25, 1.0)
+                    ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.7, 0.15, 0.15, 1.0)
+                    local confirm = ImGui.Button('Confirm Purge##EmuBot', ImVec2(150, 32))
+                    ImGui.PopStyleColor(3)
+
+                    if confirm then
+                        local ok, err = performDatabasePurge()
+                        if ok then
+                            botUI.lastPurgeWasSuccess = true
+                            botUI.lastPurgeMessage = 'Database purged successfully. Caches reset.'
+                        else
+                            botUI.lastPurgeWasSuccess = false
+                            botUI.lastPurgeMessage = string.format('Database purge failed: %s', tostring(err))
+                        end
+                        ImGui.CloseCurrentPopup()
+                    end
+
+                    ImGui.SameLine()
+                    if ImGui.Button('Cancel##EmuBot', ImVec2(150, 32)) then
+                        ImGui.CloseCurrentPopup()
+                    end
+
+                    ImGui.EndPopup()
                 end
 
                 ImGui.EndTabItem()
