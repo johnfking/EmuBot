@@ -587,22 +587,30 @@ function botUI.stopScanAllBots()
     printf('[EmuBot] Scan All Bots cancelled')
 end
 
-function botUI._awaitInventoryForBot(botName, shouldCamp)
+function botUI._awaitInventoryForBot(botName, shouldCamp, requestIssued)
     local timeout = 15 -- seconds to wait before giving up on this bot
+    local issued = requestIssued ~= false -- default true when nil
     local function poll(startTime)
         -- If scan was cancelled mid-wait, stop
         if not botUI._scanAllActive then return true end
 
         -- Check if inventory has been captured (primary check)
         local inv = bot_inventory and bot_inventory.getBotInventory and bot_inventory.getBotInventory(botName)
-        if inv and inv.equipped and #inv.equipped > 0 then
+        local requestActive = issued and bot_inventory and bot_inventory.current_bot_request == botName
+        if inv and inv.equipped and #inv.equipped > 0 and (not issued or not requestActive) then
             printf('[EmuBot] Inventory captured for %s (%d items). Current request: %s', botName, #inv.equipped, bot_inventory.current_bot_request or 'nil')
             botUI._completeScanAllBotStep(botName, shouldCamp)
             return true
         end
 
+        if issued and not requestActive then
+            printf('[EmuBot] Warning: inventory request for %s finished but no new data was detected, continuing with cached data', botName)
+            botUI._completeScanAllBotStep(botName, shouldCamp)
+            return true
+        end
+
         -- If current_bot_request changed but we don't have inventory yet, that's unexpected
-        if bot_inventory.current_bot_request ~= botName and bot_inventory.current_bot_request ~= nil then
+        if issued and bot_inventory.current_bot_request ~= botName and bot_inventory.current_bot_request ~= nil then
             printf('[EmuBot] Warning: bot_inventory moved to %s while waiting for %s (no inventory captured)', bot_inventory.current_bot_request or 'nil', botName)
             -- Give it a moment to see if inventory appears
             local elapsed = os.time() - startTime
@@ -617,7 +625,7 @@ function botUI._awaitInventoryForBot(botName, shouldCamp)
         if os.time() - startTime >= timeout then
             printf('[EmuBot] Timeout waiting for inventory from %s; proceeding.', botName)
             -- Only clear on timeout if it's still our request
-            if bot_inventory.current_bot_request == botName then
+            if issued and bot_inventory.current_bot_request == botName then
                 printf('[EmuBot] Clearing stale bot_inventory request for %s due to timeout', botName)
                 bot_inventory.current_bot_request = nil
                 bot_inventory.bot_request_start_time = nil
@@ -705,13 +713,13 @@ function botUI._processScanAllBots()
     if isSpawned then
         -- Bot is already spawned, just get inventory
         printf('[EmuBot] Bot %s already spawned, requesting inventory...', currentBot)
-        bot_inventory.requestBotInventory(currentBot)
+        local requestStarted = bot_inventory.requestBotInventory(currentBot)
         if shouldCamp then
             printf('[EmuBot] Will camp %s after inventory capture', currentBot)
         else
             printf('[EmuBot] Camping disabled - will leave %s spawned', currentBot)
         end
-        botUI._awaitInventoryForBot(currentBot, shouldCamp)
+        botUI._awaitInventoryForBot(currentBot, shouldCamp, requestStarted)
     else
         -- Bot needs to be spawned
         printf('[EmuBot] Spawning bot %s...', currentBot)
@@ -722,13 +730,13 @@ function botUI._processScanAllBots()
             local spawnCheck = mq.TLO.Spawn(string.format('= %s', currentBot))
             if spawnCheck and spawnCheck.ID and spawnCheck.ID() and spawnCheck.ID() > 0 then
                 printf('[EmuBot] Bot %s spawned, requesting inventory...', currentBot)
-                bot_inventory.requestBotInventory(currentBot)
+                local requestStarted = bot_inventory.requestBotInventory(currentBot)
                 if shouldCamp then
                     printf('[EmuBot] Will camp %s after inventory capture', currentBot)
                 else
                     printf('[EmuBot] Camping disabled - will leave %s spawned', currentBot)
                 end
-                botUI._awaitInventoryForBot(currentBot, shouldCamp)
+                botUI._awaitInventoryForBot(currentBot, shouldCamp, requestStarted)
             else
                 printf('[EmuBot] Failed to spawn bot %s, skipping...', currentBot)
                 botUI._completeScanAllBotStep(currentBot, false)
