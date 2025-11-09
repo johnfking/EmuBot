@@ -22,6 +22,10 @@ BotInventory._capture_count = {}
 BotInventory._owner = nil
 BotInventory._events_registered = false
 BotInventory._itemStatCache = {}
+BotInventory.active_capture_buffers = {}
+BotInventory.capture_expected_slots = 23
+BotInventory.capture_settle_delay = 0.2
+BotInventory.capture_timeout_seconds = 4
 
 local function normalizePathSeparators(path)
     return path and path:gsub('\\\\', '/') or nil
@@ -147,6 +151,153 @@ local function resetStateForOwner(owner)
     BotInventory._capture_count = {}
     BotInventory._owner = owner
     BotInventory._itemStatCache = {}
+    BotInventory.active_capture_buffers = {}
+end
+
+local function ensureBotInventoryRecord(botName)
+    if not botName or botName == '' then return nil end
+    local owner = BotInventory._owner or resolveCurrentOwner()
+    local record = BotInventory.bot_inventories[botName]
+    if not record then
+        record = {
+            name = botName,
+            equipped = {},
+            bags = {},
+            bank = {},
+            owner = owner,
+        }
+        BotInventory.bot_inventories[botName] = record
+    end
+    record.owner = owner
+    return record
+end
+
+local function cloneItemState(item)
+    if not item then return nil end
+    local copy = {}
+    for k, v in pairs(item) do
+        copy[k] = v
+    end
+    return copy
+end
+
+local function cloneInventoryState(data)
+    if not data then return nil end
+    local copy = {
+        name = data.name,
+        owner = data.owner,
+        bags = data.bags,
+        bank = data.bank,
+        equipped = {},
+    }
+    for _, item in ipairs(data.equipped or {}) do
+        table.insert(copy.equipped, cloneItemState(item))
+    end
+    return copy
+end
+
+local function beginCaptureBuffer(botName)
+    if not botName or botName == '' then return nil end
+    local buffer = {
+        items_by_slot = {},
+        slots_seen = {},
+        processed_slots = 0,
+        total_lines = 0,
+        last_line_time = nil,
+    }
+    BotInventory.active_capture_buffers[botName] = buffer
+    return buffer
+end
+
+local function getCaptureBuffer(botName)
+    if not botName or botName == '' then return nil end
+    return BotInventory.active_capture_buffers[botName]
+end
+
+local function resetActiveRequestState(botName)
+    if botName and botName ~= '' then
+        BotInventory._capture_count[botName] = 0
+        BotInventory.active_capture_buffers[botName] = nil
+    end
+    BotInventory.current_bot_request = nil
+    BotInventory.bot_request_start_time = nil
+    BotInventory.bot_request_phase = 0
+    BotInventory.spawn_issued_time = nil
+    BotInventory.target_issued_time = nil
+    BotInventory.invlist_issued_time = nil
+end
+
+local function buildEquippedFromBuffer(buffer)
+    if not buffer or not buffer.items_by_slot then return {} end
+    local orderedSlots = {}
+    for slotId in pairs(buffer.items_by_slot) do
+        table.insert(orderedSlots, slotId)
+    end
+    table.sort(orderedSlots, function(a, b)
+        local numA, numB = tonumber(a), tonumber(b)
+        if numA and numB then return numA < numB end
+        if numA then return true end
+        if numB then return false end
+        return tostring(a) < tostring(b)
+    end)
+    local equipped = {}
+    for _, slotId in ipairs(orderedSlots) do
+        local item = buffer.items_by_slot[slotId]
+        if item then
+            table.insert(equipped, item)
+        end
+    end
+    return equipped
+end
+
+local function finalizeBotInventoryCapture(botName, buffer)
+    buffer = buffer or getCaptureBuffer(botName)
+    if not botName or botName == '' or not buffer then return false end
+
+    local record = ensureBotInventoryRecord(botName)
+    if not record then return false end
+
+    local oldData = cloneInventoryState(record)
+    record.owner = BotInventory._owner or resolveCurrentOwner()
+    record.equipped = buildEquippedFromBuffer(buffer)
+
+    if oldData and BotInventory.compareInventoryData then
+        local mismatches = BotInventory.compareInventoryData(botName, oldData, record) or {}
+        if #mismatches > 0 then
+            print(string.format("[BotInventory] Detected %d mismatched item(s) for %s, queueing for scan",
+                #mismatches, botName))
+            if BotInventory.onMismatchDetected then
+                for _, mismatch in ipairs(mismatches) do
+                    print(string.format("[BotInventory] Queueing %s (slot %s) for scan: %s",
+                        mismatch.item.name or "unknown",
+                        tostring(mismatch.slotId),
+                        mismatch.reason))
+                    BotInventory.onMismatchDetected(mismatch.item, botName, mismatch.reason)
+                end
+            end
+        end
+    end
+
+    local meta = BotInventory.bot_list_capture_set and BotInventory.bot_list_capture_set[botName] or nil
+    local ok, err = db.save_bot_inventory(botName, record, meta)
+    if not ok then
+        print(string.format("[BotInventory][DB] Failed to save inventory for %s: %s", botName, tostring(err)))
+    end
+
+    resetActiveRequestState(botName)
+    return true
+end
+
+local function failActiveRequest(botName, reason)
+    if botName then
+        print(string.format("[BotInventory] %s", reason or string.format("Request failed for %s", botName)))
+    else
+        print(string.format("[BotInventory] %s", reason or "Request failed"))
+    end
+    if BotInventory.onBotFailure and botName then
+        BotInventory.onBotFailure(botName, reason or "Request failed")
+    end
+    resetActiveRequestState(botName)
 end
 
 local function cloneItemForExport(item)
@@ -547,30 +698,35 @@ local function displayBotInventory(line, slotNum, slotName)
     local targetName = currentTarget and currentTarget.Name and currentTarget.Name() or ""
     if targetName ~= botName then
         print(string.format(
-        "[BotInventory] WARNING: Target mismatch! Expected '%s' but target is '%s'. Ignoring inventory data.", botName,
+            "[BotInventory] WARNING: Target mismatch! Expected '%s' but target is '%s'. Ignoring inventory data.",
+            botName,
             targetName))
         return
     end
 
-    local itemlink = (mq.ExtractLinks(line) or {})[1] or { text = "Empty", link = "N/A" }
-
-    if not BotInventory.bot_inventories[botName] then
-        BotInventory.bot_inventories[botName] = {
-            name = botName,
-            equipped = {},
-            bags = {},
-            bank = {},
-            owner = BotInventory._owner or resolveCurrentOwner()
-        }
+    local slotId = tonumber(slotNum)
+    if not slotId then
+        print(string.format("[BotInventory] WARNING: Received inventory line without numeric slot for %s: %s",
+            botName, tostring(line)))
+        return
     end
-    BotInventory.bot_inventories[botName].owner = BotInventory._owner or resolveCurrentOwner()
+
+    local buffer = getCaptureBuffer(botName) or beginCaptureBuffer(botName)
+    buffer.total_lines = buffer.total_lines + 1
+    buffer.last_line_time = os.clock()
+    if not buffer.slots_seen[slotId] then
+        buffer.slots_seen[slotId] = true
+        buffer.processed_slots = buffer.processed_slots + 1
+    end
+
+    local itemlink = (mq.ExtractLinks(line) or {})[1] or { text = "Empty", link = "N/A" }
 
     if itemlink.text ~= "Empty" and itemlink.link ~= "N/A" then
         local parsedItem = BotInventory.parseItemLinkData(line)
 
         local newItem = {
             name = itemlink.text,
-            slotid = tonumber(slotNum),
+            slotid = slotId,
             slotname = slotName,
             itemlink = line,
             rawline = line,
@@ -587,43 +743,15 @@ local function displayBotInventory(line, slotNum, slotName)
             nodrop = 1
         }
         hydrateItemFromCache(newItem)
-        -- Merge behavior: replace per-slot, but preserve existing non-zero stats if new are zero
-        local eq = BotInventory.bot_inventories[botName].equipped
-        local replaced = false
-        for i = 1, #eq do
-            local it = eq[i]
-            if tonumber(it.slotid) == tonumber(slotNum) then
-                -- Preserve stats if new values are zero
-                if (newItem.ac == nil) or ((newItem.ac or 0) == 0 and (it.ac or 0) ~= 0) then newItem.ac = newItem.ac ~=
-                    nil and newItem.ac or it.ac end
-                if (newItem.hp == nil) or ((newItem.hp or 0) == 0 and (it.hp or 0) ~= 0) then newItem.hp = newItem.hp ~=
-                    nil and newItem.hp or it.hp end
-                if (newItem.mana == nil) or ((newItem.mana or 0) == 0 and (it.mana or 0) ~= 0) then newItem.mana =
-                    newItem.mana ~= nil and newItem.mana or it.mana end
-                if (newItem.icon or 0) == 0 and (it.icon or 0) ~= 0 then newItem.icon = it.icon end
-                if (newItem.damage == nil) or ((newItem.damage or 0) == 0 and (it.damage or 0) ~= 0) then newItem.damage =
-                    newItem.damage ~= nil and newItem.damage or it.damage end
-                if (newItem.delay == nil) or ((newItem.delay or 0) == 0 and (it.delay or 0) ~= 0) then newItem.delay =
-                    newItem.delay ~= nil and newItem.delay or it.delay end
-                eq[i] = newItem
-                replaced = true
-                break
-            end
-        end
-        if not replaced then table.insert(eq, newItem) end
+        buffer.items_by_slot[slotId] = newItem
         cacheItemStats(newItem)
-        -- Count capture lines for this request
-        BotInventory._capture_count[botName] = (BotInventory._capture_count[botName] or 0) + 1
-
-        -- Debug output to track inventory storage (disabled to reduce spam)
-        -- print(string.format("[BotInventory DEBUG] Stored item: %s (ID: %s, Icon: %s) in slot %s for bot %s",
-        --     item.name,
-        --     item.itemID or "N/A",
-        --     item.icon or "N/A",
-        --     slotName,
-        --     botName))
+    else
+        buffer.items_by_slot[slotId] = nil
     end
+
+    BotInventory._capture_count[botName] = buffer.processed_slots
 end
+
 
 function BotInventory.getCurrentOwner()
     BotInventory._owner = BotInventory._owner or resolveCurrentOwner()
@@ -703,7 +831,8 @@ function BotInventory.requestBotInventory(botName)
         return false
     end
 
-    -- Start request without destroying existing cache; track capture count for this request
+    -- Start request with a fresh capture buffer for this bot
+    beginCaptureBuffer(botName)
     BotInventory._capture_count[botName] = 0
     BotInventory.current_bot_request = botName
     BotInventory.bot_request_start_time = os.time()
@@ -718,79 +847,41 @@ function BotInventory.requestBotInventory(botName)
 end
 
 function BotInventory.processBotInventoryResponse()
-    if BotInventory.current_bot_request and BotInventory.bot_request_start_time then
+    local botName = BotInventory.current_bot_request
+    if botName and BotInventory.bot_request_start_time then
         local elapsed = os.time() - BotInventory.bot_request_start_time
-        local botName = BotInventory.current_bot_request
         if elapsed >= 10 then
-            print(string.format("[BotInventory] Timeout waiting for inventory from %s", botName))
-            -- Notify skip system of failure if available
-            if BotInventory.onBotFailure then
-                BotInventory.onBotFailure(botName, "Timeout waiting for inventory")
-            end
-            BotInventory.current_bot_request = nil
-            BotInventory.bot_request_start_time = nil
-            BotInventory.bot_request_phase = 0
-            BotInventory.spawn_issued_time = nil
-            BotInventory.target_issued_time = nil
-            return
-        end
-        if (BotInventory._capture_count[botName] or 0) > 0 then
-            -- Check for mismatches with previously cached data
-            local oldData = nil
-            local newData = BotInventory.bot_inventories[botName]
-
-            -- Try to get old data from database first
-            if db and db.load_all then
-                local dbData = db.load_all() or {}
-                oldData = dbData[botName]
-            end
-
-            -- Compare and detect mismatches
-            if oldData and newData then
-                local mismatches = BotInventory.compareInventoryData(botName, oldData, newData)
-                if #mismatches > 0 then
-                    print(string.format("[BotInventory] Detected %d mismatched item(s) for %s, queueing for scan",
-                        #mismatches, botName))
-
-                    -- Queue mismatched items for scanning if scan callback is available
-                    if BotInventory.onMismatchDetected then
-                        for _, mismatch in ipairs(mismatches) do
-                            print(string.format("[BotInventory] Queueing %s (slot %s) for scan: %s",
-                                mismatch.item.name or "unknown",
-                                tostring(mismatch.slotId),
-                                mismatch.reason))
-                            BotInventory.onMismatchDetected(mismatch.item, botName, mismatch.reason)
-                        end
-                    end
-                end
-            end
-
-            -- Persist to SQLite before clearing request state
-            local meta = BotInventory.bot_list_capture_set and BotInventory.bot_list_capture_set[botName] or nil
-            local ok, err = db.save_bot_inventory(botName, BotInventory.bot_inventories[botName], meta)
-            if not ok then
-                print(string.format("[BotInventory][DB] Failed to save inventory for %s: %s", botName, tostring(err)))
-            else
-                --print(string.format("[BotInventory][DB] Saved inventory for %s", botName))
-            end
-
-            --print(string.format("[BotInventory] Successfully captured inventory for %s (%d items)", botName, #BotInventory.bot_inventories[botName].equipped))
-            BotInventory.current_bot_request = nil
-            BotInventory._capture_count[botName] = 0
-            BotInventory.bot_request_start_time = nil
-            BotInventory.bot_request_phase = 0
-            BotInventory.spawn_issued_time = nil
-            BotInventory.target_issued_time = nil
-            BotInventory.invlist_issued_time = nil
+            failActiveRequest(botName, string.format("Timeout waiting for inventory from %s", botName))
             return
         end
     end
 
-    if not BotInventory.current_bot_request then
+    if not botName then
         return
     end
 
-    local botName = BotInventory.current_bot_request
+    if BotInventory.bot_request_phase == 4 then
+        local buffer = getCaptureBuffer(botName)
+        local expectedSlots = BotInventory.capture_expected_slots or 23
+        local settleDelay = BotInventory.capture_settle_delay or 0.2
+        local timeoutSeconds = BotInventory.capture_timeout_seconds or 4
+
+        if buffer and buffer.processed_slots >= expectedSlots then
+            local lastLineAge = buffer.last_line_time and (os.clock() - buffer.last_line_time) or 0
+            if lastLineAge >= settleDelay then
+                finalizeBotInventoryCapture(botName, buffer)
+                return
+            end
+        end
+
+        local pendingAge = BotInventory.invlist_issued_time and (os.clock() - BotInventory.invlist_issued_time) or 0
+        if pendingAge and pendingAge >= timeoutSeconds then
+            local captured = buffer and buffer.processed_slots or 0
+            failActiveRequest(botName, string.format(
+                "Incomplete inventory from %s (%d/%d slots)", botName, captured, expectedSlots))
+            return
+        end
+    end
 
     if BotInventory.bot_request_phase == 1 and BotInventory.target_issued_time then
         if os.clock() - BotInventory.target_issued_time >= 0.5 then
@@ -825,19 +916,11 @@ function BotInventory.processBotInventoryResponse()
                 BotInventory.bot_request_phase = 4
             end
         elseif os.clock() - BotInventory.target_issued_time >= 3.0 then
-            print(string.format("[BotInventory DEBUG] Failed to target %s after 3 seconds. Aborting.", botName))
-            -- Notify skip system of failure if available
-            if BotInventory.onBotFailure then
-                BotInventory.onBotFailure(botName, "Failed to target after 3 seconds")
-            end
-            BotInventory.bot_request_phase = 0
-            BotInventory.current_bot_request = nil
-            BotInventory.spawn_issued_time = nil
-            BotInventory.target_issued_time = nil
-            BotInventory.invlist_issued_time = nil
+            failActiveRequest(botName, string.format("Failed to target %s after 3 seconds", botName))
         end
     end
 end
+
 
 local function displayBotUnequipResponse(line, slotNum, itemName)
     if not BotInventory.current_bot_request then return end
@@ -960,16 +1043,8 @@ function BotInventory.applySwapFromCursor(botName, slotID, slotName, itemID, ite
     if not botName or slotID == nil then return false, 'bad args' end
 
     -- Ensure bot cache exists
-    BotInventory.bot_inventories[botName] = BotInventory.bot_inventories[botName] or {
-        name = botName,
-        equipped = {},
-        bags = {},
-        bank = {},
-        owner = BotInventory._owner or resolveCurrentOwner(),
-    }
-    BotInventory.bot_inventories[botName].owner = BotInventory._owner or resolveCurrentOwner()
-
-    local eq = BotInventory.bot_inventories[botName].equipped
+    local record = ensureBotInventoryRecord(botName)
+    local eq = record and record.equipped or {}
 
     local newItem = {
         name = itemName,
